@@ -1,0 +1,1039 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+//
+// Package models holds all models that are needed across packages.
+// We place these models in their own package so as to avoid circular
+// dependencies between packages (which is a compile error).
+package models
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	paths "path"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/runatlantis/atlantis/server/logging"
+)
+
+// HashPolicyItem returns the SHA-256 hex digest of a policy output item.
+func HashPolicyItem(item string) string {
+	h := sha256.Sum256([]byte(item))
+	return hex.EncodeToString(h[:])
+}
+
+// policyItemHashes returns deduplicated SHA-256 hex digests of substrings
+// matched by re in policyOutput, in first-seen order. If the regex produces
+// no matches (including when policyOutput is empty), the raw policyOutput
+// itself is hashed so there is always at least one hash.
+func policyItemHashes(policyOutput string, re *regexp.Regexp) []string {
+	matches := re.FindAllString(policyOutput, -1)
+	hashes := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, m := range matches {
+		h := HashPolicyItem(m)
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		hashes = append(hashes, h)
+	}
+	if len(hashes) == 0 {
+		hashes = append(hashes, HashPolicyItem(policyOutput))
+	}
+	return hashes
+}
+
+type PullReqStatus struct {
+	ApprovalStatus  ApprovalStatus
+	MergeableStatus MergeableStatus
+}
+
+// Repo is a VCS repository.
+type Repo struct {
+	// FullName is the owner and repo name separated
+	// by a "/", ex. "runatlantis/atlantis", "gitlab/subgroup/atlantis",
+	// "Bitbucket Server/atlantis", "azuredevops/project/atlantis".
+	FullName string
+	// Owner is just the repo owner, ex. "runatlantis" or "gitlab/subgroup"
+	// or azuredevops/project. This may contain /'s in the case of GitLab
+	// subgroups or Azure DevOps Team Projects. This may contain spaces in
+	// the case of Bitbucket Server.
+	Owner string
+	// Name is just the repo name, ex. "atlantis". This will never have
+	// /'s in it.
+	Name string
+	// CloneURL is the full HTTPS url for cloning with username and token string
+	// ex. "https://username:token@github.com/atlantis/atlantis.git".
+	CloneURL string
+	// SanitizedCloneURL is the full HTTPS url for cloning with the password
+	// redacted.
+	// ex. "https://user:<redacted>@github.com/atlantis/atlantis.git".
+	SanitizedCloneURL string
+	// VCSHost is where this repo is hosted.
+	VCSHost VCSHost
+}
+
+// ID returns the atlantis ID for this repo.
+// ID is in the form: {vcs hostname}/{repoFullName}.
+func (r Repo) ID() string {
+	return fmt.Sprintf("%s/%s", r.VCSHost.Hostname, r.FullName)
+}
+
+// NewRepo constructs a Repo object. repoFullName is the owner/repo form,
+// cloneURL can be with or without .git at the end
+// ex. https://github.com/runatlantis/atlantis.git OR
+//
+//	https://github.com/runatlantis/atlantis
+//
+// vcsHostname is the configured hostname for the VCS (may include a subpath
+// for GitLab, e.g. "acme.com/gitlab"). Pass empty string to skip the
+// enhanced host/subpath validation; non-GitLab callers always pass "".
+func NewRepo(vcsHostType VCSHostType, repoFullName string, cloneURL string, vcsUser string, vcsToken string, vcsHostname string) (Repo, error) {
+	if repoFullName == "" {
+		return Repo{}, errors.New("repoFullName can't be empty")
+	}
+	if cloneURL == "" {
+		return Repo{}, errors.New("cloneURL can't be empty")
+	}
+
+	// Azure DevOps doesn't work with .git suffix on clone URLs
+	if !strings.HasSuffix(cloneURL, ".git") && vcsHostType != AzureDevops {
+		cloneURL += ".git"
+	}
+
+	cloneURLParsed, err := url.Parse(cloneURL)
+	if err != nil {
+		return Repo{}, fmt.Errorf("invalid clone url: %w", err)
+	}
+
+	// Ensure the Clone URL is for the same repo to avoid something malicious.
+	// We skip this check for Bitbucket Server because its format is different
+	// and because the caller in that case actually constructs the clone url
+	// from the repo name and so there's no point checking if they match.
+	// Azure DevOps also does not require .git at the end of clone urls.
+	if vcsHostType != BitbucketServer && vcsHostType != AzureDevops {
+		expClonePath := fmt.Sprintf("/%s.git", repoFullName)
+
+		if vcsHostType == Gitlab && vcsHostname != "" {
+			expectedHost, basePath, parseErr := ParseGitlabHostname(vcsHostname)
+			if parseErr != nil {
+				return Repo{}, fmt.Errorf("parsing configured gitlab hostname %q: %w", vcsHostname, parseErr)
+			}
+			if !strings.EqualFold(cloneURLParsed.Host, expectedHost) {
+				return Repo{}, fmt.Errorf("expected clone url host %q but had %q", expectedHost, cloneURLParsed.Host)
+			}
+			expClonePath = basePath + expClonePath
+		}
+
+		if expClonePath != cloneURLParsed.Path {
+			return Repo{}, fmt.Errorf("expected clone url to have path %q but had %q", expClonePath, cloneURLParsed.Path)
+		}
+	}
+
+	// We url encode because we're using them in a URL and weird characters can
+	// mess up git.
+	cloneURL = strings.ReplaceAll(cloneURL, " ", "%20")
+	escapedVCSUser := url.QueryEscape(vcsUser)
+	escapedVCSToken := url.QueryEscape(vcsToken)
+	auth := fmt.Sprintf("%s:%s@", escapedVCSUser, escapedVCSToken)
+	redactedAuth := fmt.Sprintf("%s:<redacted>@", escapedVCSUser)
+
+	// Construct clone urls with http and https auth. Need to do both
+	// because Bitbucket supports http.
+	authedCloneURL := strings.ReplaceAll(cloneURL, "https://", "https://"+auth)
+	authedCloneURL = strings.ReplaceAll(authedCloneURL, "http://", "http://"+auth)
+	sanitizedCloneURL := strings.ReplaceAll(cloneURL, "https://", "https://"+redactedAuth)
+	sanitizedCloneURL = strings.ReplaceAll(sanitizedCloneURL, "http://", "http://"+redactedAuth)
+
+	// Get the owner and repo names from the full name.
+	owner, repo := SplitRepoFullName(repoFullName)
+	if owner == "" || repo == "" {
+		return Repo{}, fmt.Errorf("invalid repo format %q, owner %q or repo %q was empty", repoFullName, owner, repo)
+	}
+	// Only GitLab and AzureDevops repos can have /'s in their owners.
+	// This is for GitLab subgroups and Azure DevOps Team Projects.
+	if strings.Contains(owner, "/") && vcsHostType != Gitlab && vcsHostType != AzureDevops {
+		return Repo{}, fmt.Errorf("invalid repo format %q, owner %q should not contain any /'s", repoFullName, owner)
+	}
+	if strings.Contains(repo, "/") {
+		return Repo{}, fmt.Errorf("invalid repo format %q, repo %q should not contain any /'s", repoFullName, owner)
+	}
+	if strings.Contains(owner, "..") || strings.Contains(repo, "..") {
+		return Repo{}, fmt.Errorf("invalid repo format %q, owner or repo cannot contain '..'", repoFullName)
+	}
+
+	return Repo{
+		FullName:          repoFullName,
+		Owner:             owner,
+		Name:              repo,
+		CloneURL:          authedCloneURL,
+		SanitizedCloneURL: sanitizedCloneURL,
+		VCSHost: VCSHost{
+			Type:     vcsHostType,
+			Hostname: cloneURLParsed.Hostname(),
+		},
+	}, nil
+}
+
+type ApprovalStatus struct {
+	IsApproved bool
+	ApprovedBy string
+	Date       time.Time
+}
+
+type MergeableStatus struct {
+	IsMergeable bool
+	// Short human readable explanation of why the PR is (or is not) mergeable
+	Reason string
+	// BlockingStatuses holds the names of the commit statuses that caused the
+	// pull request to be considered not mergeable because of the project's
+	// "Only allow merge if pipeline succeeds" setting. It lets per-project
+	// command requirement checks ignore statuses that belong to other projects
+	// in the same pull request (a failing plan in project B must not block an
+	// apply of project A). Currently only populated by the GitLab client.
+	BlockingStatuses []string
+}
+
+// PullRequest is a VCS pull request.
+// GitLab calls these Merge Requests.
+type PullRequest struct {
+	// Num is the pull request number or ID.
+	Num int
+	// HeadCommit is a sha256 that points to the head of the branch that is being
+	// pull requested into the base. If the pull request is from Bitbucket Cloud
+	// the string will only be 12 characters long because Bitbucket Cloud
+	// truncates its commit IDs.
+	HeadCommit string
+	// URL is the url of the pull request.
+	// ex. "https://github.com/runatlantis/atlantis/pull/1"
+	URL string
+	// HeadBranch is the name of the head branch (the branch that is getting
+	// merged into the base).
+	HeadBranch string
+	// BaseBranch is the name of the base branch (the branch that the pull
+	// request is getting merged into).
+	BaseBranch string
+	// HardenedNonPRRefCheckout makes synthetic non-PR API checkouts fetch the
+	// requested ref directly instead of treating it as a branch checkout. This is
+	// used by drift/remediation requests that accept branch, tag, and SHA refs.
+	HardenedNonPRRefCheckout bool
+	// Author is the username of the pull request author.
+	Author string
+	// Body is the description of the pull request. It may be empty when the VCS
+	// payload omits a description.
+	Body string
+	// State will be one of Open or Closed.
+	// Gitlab supports an additional "merged" state but Github doesn't so we map
+	// merged to Closed.
+	State PullRequestState
+	// BaseRepo is the repository that the pull request will be merged into.
+	BaseRepo Repo
+}
+
+// PullRequestOptions is used to set optional paralmeters for PullRequest
+type PullRequestOptions struct {
+	// When DeleteSourceBranchOnMerge flag is set to true VCS deletes the source branch after the PR is merged
+	// Applied by GitLab & AzureDevops
+	DeleteSourceBranchOnMerge bool
+	// MergeMethod specifies the merge method for the VCS
+	// Implemented only for Github
+	MergeMethod string
+}
+
+type PullRequestState int
+
+const (
+	OpenPullState PullRequestState = iota
+	ClosedPullState
+)
+
+type PullRequestEventType int
+
+const (
+	OpenedPullEvent PullRequestEventType = iota
+	UpdatedPullEvent
+	ClosedPullEvent
+	OtherPullEvent
+)
+
+func (p PullRequestEventType) String() string {
+	switch p {
+	case OpenedPullEvent:
+		return "opened"
+	case UpdatedPullEvent:
+		return "updated"
+	case ClosedPullEvent:
+		return "closed"
+	case OtherPullEvent:
+		return "other"
+	}
+	return "<missing String() implementation>"
+}
+
+// User is a VCS user.
+// During an autoplan, the user will be the Atlantis API user.
+type User struct {
+	Username string
+	Teams    []string
+}
+
+// ProjectLock represents a lock on a project.
+type ProjectLock struct {
+	// Project is the project that is being locked.
+	Project Project
+	// Pull is the pull request from which the command was run that
+	// created this lock.
+	Pull PullRequest
+	// User is the username of the user that ran the command
+	// that created this lock.
+	User User
+	// Workspace is the Terraform workspace that this
+	// lock is being held against.
+	Workspace string
+	// Time is the time at which the lock was first created.
+	Time time.Time
+}
+
+// Project represents a Terraform project. Since there may be multiple
+// Terraform projects in a single repo we also include Path to the project
+// root relative to the repo root.
+type Project struct {
+	// ProjectName of the project
+	ProjectName string
+	// RepoFullName is the owner and repo name, ex. "runatlantis/atlantis"
+	RepoFullName string
+	// Path to project root in the repo.
+	// If "." then project is at root.
+	// Never ends in "/".
+	// todo: rename to RepoRelDir to match rest of project once we can separate
+	// out how this is saved in boltdb vs. its usage everywhere else so we don't
+	// break existing dbs.
+	Path string
+}
+
+func (p Project) String() string {
+	// TODO: Incorporate ProjectName?
+	return fmt.Sprintf("repofullname=%s path=%s", p.RepoFullName, p.Path)
+}
+
+// Plan is the result of running an Atlantis plan command.
+// This model is used to represent a plan on disk.
+type Plan struct {
+	// Project is the project this plan is for.
+	Project Project
+	// LocalPath is the absolute path to the plan on disk
+	// (versus the relative path from the repo root).
+	LocalPath string
+}
+
+// GenerateLockKey creates a consistent lock key from a project and workspace.
+// This ensures the same format is used across all locking operations.
+func GenerateLockKey(project Project, workspace string) string {
+	return fmt.Sprintf("%s/%s/%s/%s", project.RepoFullName, project.Path, workspace, project.ProjectName)
+}
+
+// NewProject constructs a Project. Use this constructor because it
+// sets Path correctly.
+func NewProject(repoFullName string, path string, projectName string) Project {
+	path = paths.Clean(path)
+	if path == "/" {
+		path = "."
+	}
+	return Project{
+		ProjectName:  projectName,
+		RepoFullName: repoFullName,
+		Path:         path,
+	}
+}
+
+// VCSHost is a Git hosting provider, for example GitHub.
+type VCSHost struct {
+	// Hostname is the hostname of the VCS provider, ex. "github.com" or
+	// "github-enterprise.example.com".
+	Hostname string
+
+	// Type is which type of VCS host this is, ex. GitHub or GitLab.
+	Type VCSHostType
+}
+
+type VCSHostType int
+
+const (
+	Github VCSHostType = iota
+	Gitlab
+	BitbucketCloud
+	BitbucketServer
+	AzureDevops
+	Gitea
+)
+
+func (h VCSHostType) String() string {
+	switch h {
+	case Github:
+		return "Github"
+	case Gitlab:
+		return "Gitlab"
+	case BitbucketCloud:
+		return "BitbucketCloud"
+	case BitbucketServer:
+		return "BitbucketServer"
+	case AzureDevops:
+		return "AzureDevops"
+	case Gitea:
+		return "Gitea"
+	}
+	return "<missing String() implementation>"
+}
+
+func NewVCSHostType(t string) (VCSHostType, error) {
+	switch t {
+	case "Github":
+		return Github, nil
+	case "Gitlab":
+		return Gitlab, nil
+	case "BitbucketCloud":
+		return BitbucketCloud, nil
+	case "BitbucketServer":
+		return BitbucketServer, nil
+	case "AzureDevops":
+		return AzureDevops, nil
+	case "Gitea":
+		return Gitea, nil
+	}
+
+	return -1, fmt.Errorf("%q is not a valid type", t)
+}
+
+// SplitRepoFullName splits a repo full name up into its owner and repo
+// name segments. If the repoFullName is malformed, may return empty
+// strings for owner or repo.
+// Ex. runatlantis/atlantis => (runatlantis, atlantis)
+//
+//	gitlab/subgroup/runatlantis/atlantis => (gitlab/subgroup/runatlantis, atlantis)
+//	azuredevops/project/atlantis => (azuredevops/project, atlantis)
+func SplitRepoFullName(repoFullName string) (owner string, repo string) {
+	lastSlashIdx := strings.LastIndex(repoFullName, "/")
+	if lastSlashIdx == -1 || lastSlashIdx == len(repoFullName)-1 {
+		return "", ""
+	}
+
+	return repoFullName[:lastSlashIdx], repoFullName[lastSlashIdx+1:]
+}
+
+// PlanSuccess is the result of a successful plan.
+type PlanSuccess struct {
+	// TerraformOutput is the output from Terraform of running plan.
+	TerraformOutput string
+	// LockURL is the full URL to the lock held by this plan.
+	LockURL string
+	// RePlanCmd is the command that users should run to re-plan this project.
+	RePlanCmd string
+	// ApplyCmd is the command that users should run to apply this plan.
+	ApplyCmd string
+	// MergedAgain is true if we're using the checkout merge strategy and the
+	// branch we're merging into had been updated, and we had to merge again
+	// before planning
+	MergedAgain bool
+}
+
+func NewPolicySetResult(policySetName string, policyOutput string, passed bool, reqApprovalCount int, policyItemRegex string) (*PolicySetResult, error) {
+	re, err := regexp.Compile(policyItemRegex)
+	if err != nil {
+		return nil, fmt.Errorf("compiling policy_item_regex %q for policy set %q: %w", policyItemRegex, policySetName, err)
+	}
+	hashes := policyItemHashes(policyOutput, re)
+	return &PolicySetResult{
+		PolicySetName:    policySetName,
+		PolicyOutput:     policyOutput,
+		Passed:           passed,
+		ReqApprovalCount: reqApprovalCount,
+		Hashes:           hashes,
+		PolicyItemRegex:  policyItemRegex,
+	}, nil
+}
+
+type PolicySetResult struct {
+	PolicySetName    string
+	PolicyOutput     string
+	Passed           bool
+	ReqApprovalCount int
+	Approvals        []PolicySetApproval
+	Hashes           []string
+	PolicyItemRegex  string
+}
+
+type PolicySetApproval struct {
+	Approver string
+	Hashes   []string
+}
+
+// ApprovalCoversAllHashes reports whether approvalHashes contains every element of required.
+func ApprovalCoversAllHashes(approvalHashes, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	set := make(map[string]struct{}, len(approvalHashes))
+	for _, h := range approvalHashes {
+		set[h] = struct{}{}
+	}
+	for _, h := range required {
+		if _, ok := set[h]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// PolicySetStatus tracks the approval state for a given policy set.
+type PolicySetStatus struct {
+	PolicySetName   string
+	Passed          bool
+	Approvals       []PolicySetApproval
+	Hashes          []string
+	PolicyItemRegex string
+}
+
+// GetCurApprovals returns the number of approvals that cover all hashes in this policy set.
+func (pss *PolicySetStatus) GetCurApprovals() int {
+	n := 0
+	for _, approval := range pss.Approvals {
+		if ApprovalCoversAllHashes(approval.Hashes, pss.Hashes) {
+			n++
+		}
+	}
+	return n
+}
+
+func (pss *PolicySetStatus) OwnerHasFullyApproved(owner string) bool {
+	for _, approval := range pss.Approvals {
+		if approval.Approver == owner && ApprovalCoversAllHashes(approval.Hashes, pss.Hashes) {
+			return true
+		}
+	}
+	return false
+}
+
+// Summary regexes
+var (
+	reChangesOutside = regexp.MustCompile(`Note: Objects have changed outside of Terraform`)
+	rePlanChanges    = regexp.MustCompile(
+		`Plan: (?:(\d+) to import, )?(\d+) to add, (\d+) to change, (\d+) to destroy(?:, (\d+) to forget)?\.`,
+	)
+	reNoChanges = regexp.MustCompile(`No changes. (Infrastructure is up-to-date|Your infrastructure matches the configuration).`)
+)
+
+// Summary extracts summaries of plan changes from TerraformOutput.
+func (p *PlanSuccess) Summary() string {
+	note := ""
+	if match := reChangesOutside.FindString(p.TerraformOutput); match != "" {
+		note = "\n**" + match + "**\n"
+	}
+	return note + p.DiffSummary()
+}
+
+// DiffSummary extracts one line summary of plan changes from TerraformOutput.
+// When the output contains multiple "Plan:" lines (e.g. terragrunt stack run
+// plan, which prints one summary per unit), the counters are aggregated so the
+// rendered summary reflects the total across all units.
+func (p *PlanSuccess) DiffSummary() string {
+	stats := NewPlanSuccessStats(p.TerraformOutput)
+	if !stats.Changes {
+		return reNoChanges.FindString(p.TerraformOutput)
+	}
+	switch {
+	case stats.Import > 0 && stats.Forget > 0:
+		return fmt.Sprintf("Plan: %d to import, %d to add, %d to change, %d to destroy, %d to forget.",
+			stats.Import, stats.Add, stats.Change, stats.Destroy, stats.Forget)
+	case stats.Import > 0:
+		return fmt.Sprintf("Plan: %d to import, %d to add, %d to change, %d to destroy.",
+			stats.Import, stats.Add, stats.Change, stats.Destroy)
+	case stats.Forget > 0:
+		return fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy, %d to forget.",
+			stats.Add, stats.Change, stats.Destroy, stats.Forget)
+	default:
+		return fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy.",
+			stats.Add, stats.Change, stats.Destroy)
+	}
+}
+
+// NoChanges returns true if the plan has no changes.
+func (p *PlanSuccess) NoChanges() bool {
+	if p.Stats().Changes {
+		return false
+	}
+	return reNoChanges.MatchString(p.TerraformOutput)
+}
+
+// Diff Markdown regexes
+var (
+	diffKeywordRegex                  = regexp.MustCompile(`(?m)^( +)([-+~]\s)([a-zA-Z_][\w]*\s*)(\s=\s|\s->\s|\(known after apply\)|\{)(.*)`)
+	diffResourceRegex                 = regexp.MustCompile(`(?m)^( +)([-+~]\s)((?:resource|data|module)\s+.+\{.*)`)
+	diffHeredocRegex                  = regexp.MustCompile(`(?m)^( +)([-+~]\s)(<<)(.*)`)
+	diffColonRegex                    = regexp.MustCompile(`(?m)^( +)([-+~]\s)( {4,}[a-zA-Z_][\w-]*:.*)`)
+	diffListRegex                     = regexp.MustCompile(`(?m)^( +)([-+~]\s)(".*",)`)
+	diffTildeRegex                    = regexp.MustCompile(`(?m)^~`)
+	diffHeredocAttributeStartRegex    = regexp.MustCompile(`^( *)([-+~]\s)?[a-zA-Z_][\w]*\s*=\s<<-?([a-zA-Z_][\w]*)\s*$`)
+	diffHeredocCollectionElementRegex = regexp.MustCompile(`^( *)([-+~]\s)<<-?([a-zA-Z_][\w]*)\s*$`)
+	diffHeredocContentLineRegex       = regexp.MustCompile(`^( +)([-+~]\s)(.*)`)
+)
+
+// DiffMarkdownFormattedTerraformOutput formats the Terraform output to match diff markdown format
+func (p PlanSuccess) DiffMarkdownFormattedTerraformOutput() string {
+	lines := strings.Split(p.TerraformOutput, "\n")
+	heredocDelimiter := ""
+	heredocTerminatorIndent := -1
+	heredocDiffMarkerIndent := -1
+
+	for i, line := range lines {
+		if heredocDelimiter != "" {
+			if isDiffMarkdownHeredocEnd(line, heredocDelimiter, heredocTerminatorIndent) {
+				heredocDelimiter = ""
+				heredocTerminatorIndent = -1
+				heredocDiffMarkerIndent = -1
+				continue
+			}
+
+			if heredocDiffMarkerIndent >= 0 {
+				lines[i] = formatHeredocDiffMarkdownLine(line, heredocDiffMarkerIndent)
+			}
+			continue
+		}
+
+		if delimiter, terminatorIndent, diffMarkerIndent, ok := diffMarkdownHeredocStart(line); ok {
+			heredocDelimiter = delimiter
+			heredocTerminatorIndent = terminatorIndent
+			heredocDiffMarkerIndent = diffMarkerIndent
+		}
+
+		lines[i] = formatDiffMarkdownLine(line)
+	}
+
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func formatDiffMarkdownLine(line string) string {
+	formattedLine := diffKeywordRegex.ReplaceAllString(line, "$2$1$3$4$5")
+	formattedLine = diffResourceRegex.ReplaceAllString(formattedLine, "$2$1$3")
+	formattedLine = diffHeredocRegex.ReplaceAllString(formattedLine, "$2$1$3$4")
+	formattedLine = diffColonRegex.ReplaceAllString(formattedLine, "$2$1$3")
+	formattedLine = diffListRegex.ReplaceAllString(formattedLine, "$2$1$3")
+	formattedLine = diffTildeRegex.ReplaceAllString(formattedLine, "!")
+
+	return formattedLine
+}
+
+func diffMarkdownHeredocStart(line string) (string, int, int, bool) {
+	if heredocMatch := diffHeredocAttributeStartRegex.FindStringSubmatch(line); heredocMatch != nil {
+		return diffMarkdownHeredocState(heredocMatch[1], heredocMatch[2], heredocMatch[3], len(heredocMatch[1])+4)
+	}
+
+	if heredocMatch := diffHeredocCollectionElementRegex.FindStringSubmatch(line); heredocMatch != nil {
+		return diffMarkdownHeredocState(heredocMatch[1], heredocMatch[2], heredocMatch[3], len(heredocMatch[1])+len(heredocMatch[2])+2)
+	}
+
+	return "", -1, -1, false
+}
+
+func diffMarkdownHeredocState(indent string, marker string, delimiter string, diffMarkerIndent int) (string, int, int, bool) {
+	terminatorIndent := len(indent) + len(marker)
+	if !strings.HasPrefix(marker, "~") {
+		return delimiter, terminatorIndent, -1, true
+	}
+
+	// Terraform renders changed heredoc content diff markers two spaces deeper
+	// than the heredoc terminator.
+	return delimiter, terminatorIndent, diffMarkerIndent, true
+}
+
+func isDiffMarkdownHeredocEnd(line string, delimiter string, indent int) bool {
+	terminator := strings.Repeat(" ", indent) + delimiter
+	return line == terminator ||
+		line == terminator+"," ||
+		strings.HasPrefix(line, terminator+" -> ") ||
+		strings.HasPrefix(line, terminator+", -> ")
+}
+
+func formatHeredocDiffMarkdownLine(line string, diffMarkerIndent int) string {
+	matches := diffHeredocContentLineRegex.FindStringSubmatch(line)
+	if matches == nil || len(matches[1]) != diffMarkerIndent {
+		return line
+	}
+
+	return diffTildeRegex.ReplaceAllString(matches[2]+matches[1]+matches[3], "!")
+}
+
+// Stats returns plan change stats and contextual information.
+func (p PlanSuccess) Stats() PlanSuccessStats {
+	return NewPlanSuccessStats(p.TerraformOutput)
+}
+
+// PolicyCheckResults is the result of a successful policy check run.
+type PolicyCheckResults struct {
+	PreConftestOutput  string
+	PostConftestOutput string
+	// PolicySetResults is the output from policy check binary(conftest|opa)
+	PolicySetResults []PolicySetResult
+	// LockURL is the full URL to the lock held by this policy check.
+	LockURL string
+	// RePlanCmd is the command that users should run to re-plan this project.
+	RePlanCmd string
+	// ApplyCmd is the command that users should run to apply this plan.
+	ApplyCmd string
+	// ApprovePoliciesCmd is the command that users should run to approve policies for this plan.
+	ApprovePoliciesCmd string
+	// HasDiverged is true if we're using the checkout merge strategy and the
+	// branch we're merging into has been updated since we cloned and merged
+	// it.
+	HasDiverged bool
+}
+
+// ImportSuccess is the result of a successful import run.
+type ImportSuccess struct {
+	// Output is the output from terraform import
+	Output string
+	// RePlanCmd is the command that users should run to re-plan this project.
+	RePlanCmd string
+}
+
+// StateRmSuccess is the result of a successful state rm run.
+type StateRmSuccess struct {
+	// Output is the output from terraform state rm
+	Output string
+	// RePlanCmd is the command that users should run to re-plan this project.
+	RePlanCmd string
+}
+
+func (p *PolicyCheckResults) CombinedOutput() string {
+	combinedOutput := ""
+	for _, psResult := range p.PolicySetResults {
+		// accounting for json output from conftest.
+		for psResultLine := range strings.SplitSeq(psResult.PolicyOutput, "\\n") {
+			combinedOutput = fmt.Sprintf("%s\n%s", combinedOutput, psResultLine)
+		}
+	}
+	return combinedOutput
+}
+
+// Summary extracts one line summary of each policy check.
+func (p *PolicyCheckResults) Summary() string {
+	note := ""
+	for _, policySetResult := range p.PolicySetResults {
+		r := regexp.MustCompile(`\d+ tests?, \d+ passed, \d+ warnings?, \d+ failures?, \d+ exceptions?(, \d skipped)?`)
+		if match := r.FindString(policySetResult.PolicyOutput); match != "" {
+			note = fmt.Sprintf("%s\npolicy set: %s: %s", note, policySetResult.PolicySetName, match)
+		}
+	}
+	return strings.Trim(note, "\n")
+}
+
+// PolicyCleared is used to determine if policies have all succeeded or been approved.
+func (p *PolicyCheckResults) PolicyCleared() bool {
+	passing := true
+	for _, policySetResult := range p.PolicySetResults {
+		if !policySetResult.Passed && (policySetResult.GetCurApprovals() < policySetResult.ReqApprovalCount) {
+			passing = false
+		}
+	}
+	return passing
+}
+
+// PolicySummary returns a summary of the current approval state of policy sets.
+func (p *PolicyCheckResults) PolicySummary() string {
+	var summary []string
+	for _, policySetResult := range p.PolicySetResults {
+		if policySetResult.Passed {
+			summary = append(summary, fmt.Sprintf("policy set: %s: passed.", policySetResult.PolicySetName))
+		} else if policySetResult.GetCurApprovals() >= policySetResult.ReqApprovalCount {
+			summary = append(summary, fmt.Sprintf("policy set: %s: approved.", policySetResult.PolicySetName))
+		} else {
+			summary = append(summary, fmt.Sprintf("policy set: %s: requires: %d approval(s), have: %d.", policySetResult.PolicySetName, policySetResult.ReqApprovalCount, policySetResult.GetCurApprovals()))
+		}
+	}
+	return strings.Join(summary, "\n")
+}
+
+// GetCurApprovals returns the number of approvals that cover all hashes in this policy set result.
+func (p *PolicySetResult) GetCurApprovals() int {
+	n := 0
+	for _, approval := range p.Approvals {
+		if ApprovalCoversAllHashes(approval.Hashes, p.Hashes) {
+			n++
+		}
+	}
+	return n
+}
+
+// ApprovedHashes returns the deduplicated union of hashes across all approvals.
+func (p *PolicySetResult) ApprovedHashes() []string {
+	seen := make(map[string]struct{})
+	var result []string
+	for _, approval := range p.Approvals {
+		for _, h := range approval.Hashes {
+			if _, ok := seen[h]; !ok {
+				seen[h] = struct{}{}
+				result = append(result, h)
+			}
+		}
+	}
+	return result
+}
+
+func (p *PolicySetResult) PolicySetHashes(policyItemRegex string) ([]string, error) {
+	re, err := regexp.Compile(policyItemRegex)
+	if err != nil {
+		return nil, fmt.Errorf("compiling policy_item_regex %q: %w", policyItemRegex, err)
+	}
+	return policyItemHashes(p.PolicyOutput, re), nil
+}
+
+type VersionSuccess struct {
+	VersionOutput string
+}
+
+// PullStatus is the current status of a pull request that is in progress.
+type PullStatus struct {
+	// Projects are the projects that have been modified in this pull request.
+	Projects []ProjectStatus
+	// Pull is the original pull request model.
+	Pull PullRequest
+}
+
+// StatusCount returns the number of projects that have status.
+func (p PullStatus) StatusCount(status ProjectPlanStatus) int {
+	c := 0
+	for _, pr := range p.Projects {
+		if pr.Status == status {
+			c++
+		}
+	}
+	return c
+}
+
+// ProjectCounts holds the success/failure counts for a set of project operations.
+// For command.Apply: Errored counts projects with apply errors. NoChanges is a
+// subset of Success (projects that were already up to date count as successful).
+// NoChanges is ignored for all other commands.
+type ProjectCounts struct {
+	Success   int
+	Total     int
+	Errored   int
+	NoChanges int
+}
+
+// ProjectStatus is the status of a specific project.
+type ProjectStatus struct {
+	Workspace   string
+	RepoRelDir  string
+	ProjectName string
+	// PolicyStatus tracks the policy check status for each policy set.
+	PolicyStatus []PolicySetStatus
+	// Status is the status of where this project is at in the planning cycle.
+	Status ProjectPlanStatus
+}
+
+// ProjectPlanStatus is the status of where this project is at in the planning
+// cycle.
+type ProjectPlanStatus int
+
+const (
+	// ErroredPlanStatus means that this plan has an error or the apply has an
+	// error.
+	ErroredPlanStatus ProjectPlanStatus = iota
+	// PlannedPlanStatus means that a plan has been successfully generated but
+	// not yet applied.
+	PlannedPlanStatus
+	// PlannedNoChangesPlanStatus means that a plan has been successfully
+	// generated with "No changes" and not yet applied.
+	PlannedNoChangesPlanStatus
+	// ErroredApplyStatus means that a plan has been generated but there was an
+	// error while applying it.
+	ErroredApplyStatus
+	// AppliedPlanStatus means that a plan has been generated and applied
+	// successfully.
+	AppliedPlanStatus
+	// DiscardedPlanStatus means that there was an unapplied plan that was
+	// discarded due to a project being unlocked
+	DiscardedPlanStatus
+	// ErroredPolicyCheckStatus means that the policy check errored or has
+	// failing policies.
+	ErroredPolicyCheckStatus
+	// PassedPolicyCheckStatus means that all policy checks passed or were
+	// approved.
+	PassedPolicyCheckStatus
+)
+
+// String returns a string representation of the status.
+func (p ProjectPlanStatus) String() string {
+	switch p {
+	case ErroredPlanStatus:
+		return "plan_errored"
+	case PlannedPlanStatus:
+		return "planned"
+	case PlannedNoChangesPlanStatus:
+		return "planned_no_changes"
+	case ErroredApplyStatus:
+		return "apply_errored"
+	case AppliedPlanStatus:
+		return "applied"
+	case DiscardedPlanStatus:
+		return "plan_discarded"
+	case ErroredPolicyCheckStatus:
+		return "policy_check_errored"
+	case PassedPolicyCheckStatus:
+		return "policy_check_passed"
+	default:
+		panic("missing String() impl for ProjectPlanStatus")
+	}
+}
+
+// TeamAllowlistCheckerContext defines the context for a TeamAllowlistChecker to verify
+// command permissions.
+type TeamAllowlistCheckerContext struct {
+	// BaseRepo is the repository that the pull request will be merged into.
+	BaseRepo Repo
+
+	// The name of the command that is being executed, i.e. 'plan', 'apply' etc.
+	CommandName string
+
+	// EscapedCommentArgs are the extra arguments that were added to the atlantis
+	// command, ex. atlantis plan -- -target=resource. We then escape them
+	// by adding a \ before each character so that they can be used within
+	// sh -c safely, i.e. sh -c "terraform plan $(touch bad)".
+	EscapedCommentArgs []string
+
+	// HeadRepo is the repository that is getting merged into the BaseRepo.
+	// If the pull request branch is from the same repository then HeadRepo will
+	// be the same as BaseRepo.
+	HeadRepo Repo
+
+	// Log is a logger that's been set up for this context.
+	Log logging.SimpleLogging
+
+	// Pull is the pull request we're responding to.
+	Pull PullRequest
+
+	// ProjectName is the name of the project set in atlantis.yaml. If there was
+	// no name this will be an empty string.
+	ProjectName string
+
+	// RepoDir is the absolute path to the repo root
+	RepoDir string
+
+	// RepoRelDir is the directory of this project relative to the repo root.
+	RepoRelDir string
+
+	// User is the user that triggered this command.
+	User User
+
+	// Verbose is true when the user would like verbose output.
+	Verbose bool
+
+	// Workspace is the Terraform workspace this project is in. It will always
+	// be set.
+	Workspace string
+
+	// API is true if plan/apply by API endpoints
+	API bool
+}
+
+// WorkflowHookCommandContext defines the context for a pre and post workflow_hooks that will
+// be executed before workflows.
+type WorkflowHookCommandContext struct {
+	// BaseRepo is the repository that the pull request will be merged into.
+	BaseRepo Repo
+	// The name of the command that is being executed, i.e. 'plan', 'apply' etc.
+	CommandName string
+	// Set true if there were any errors during the command execution
+	CommandHasErrors bool
+	// EscapedCommentArgs are the extra arguments that were added to the atlantis
+	// command, ex. atlantis plan -- -target=resource. We then escape them
+	// by adding a \ before each character so that they can be used within
+	// sh -c safely, i.e. sh -c "terraform plan $(touch bad)".
+	EscapedCommentArgs []string
+	// HeadRepo is the repository that is getting merged into the BaseRepo.
+	// If the pull request branch is from the same repository then HeadRepo will
+	// be the same as BaseRepo.
+	HeadRepo Repo
+	// HookDescription is a description of the hook that is being executed.
+	HookDescription string
+	// UUID for reference
+	HookID string
+	// HookStepName is the name of the step that is being executed.
+	HookStepName string
+	// Log is a logger that's been set up for this context.
+	Log logging.SimpleLogging
+	// Pull is the pull request we're responding to.
+	Pull PullRequest
+	// ProjectName is the name of the project set in atlantis.yaml. If there was
+	// no name this will be an empty string.
+	ProjectName string
+	// SuppressJobOutput prevents hook output from being published to the public
+	// job stream for API workflows such as drift detection.
+	SuppressJobOutput bool
+	// RepoRelDir is the directory of this project relative to the repo root.
+	RepoRelDir string
+	// User is the user that triggered this command.
+	User User
+	// Verbose is true when the user would like verbose output.
+	Verbose bool
+	// Workspace is the Terraform workspace this project is in. It will always
+	// be set.
+	Workspace string
+	// API is true if plan/apply by API endpoints
+	API bool
+}
+
+// PlanSuccessStats holds stats for a plan.
+type PlanSuccessStats struct {
+	Import, Add, Change, Destroy, Forget int
+	Changes, ChangesOutside              bool
+}
+
+func NewPlanSuccessStats(output string) PlanSuccessStats {
+	matches := rePlanChanges.FindAllStringSubmatch(output, -1)
+
+	s := PlanSuccessStats{
+		ChangesOutside: reChangesOutside.MatchString(output),
+		Changes:        len(matches) > 0,
+	}
+
+	// When the output contains multiple "Plan:" lines (e.g. terragrunt stack
+	// run plan produces one summary per unit), aggregate the counters so the
+	// stats reflect the total across all units.
+	//
+	// m[1] is the optional "X to import" group: it is an empty string for
+	// plans without import blocks. m[5] is the optional "X to forget" group:
+	// it is absent or empty for plans without forget blocks. All captures must
+	// be parsed leniently.
+	for _, m := range matches {
+		s.Import += parsePlanCount(m[1])
+		s.Add += parsePlanCount(m[2])
+		s.Change += parsePlanCount(m[3])
+		s.Destroy += parsePlanCount(m[4])
+		if len(m) > 5 && m[5] != "" {
+			s.Forget += parsePlanCount(m[5])
+		}
+	}
+
+	return s
+}
+
+// parsePlanCount converts a numeric capture group from rePlanChanges into an
+// int. The "to import" group is optional in the regexp, so an empty string is
+// a normal case (no import block) and must produce 0 rather than be treated
+// as a parse failure. A non-empty value that fails to parse is unreachable
+// given the (\d+) capture, but we return 0 defensively rather than panic.
+func parsePlanCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	n, _ := strconv.Atoi(s)
+	return n
+}

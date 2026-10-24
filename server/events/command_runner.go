@@ -1,0 +1,734 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+
+package events
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/drmaxgit/go-azuredevops/azuredevops"
+	"github.com/google/go-github/v88/github"
+	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/events/vcs"
+	"github.com/runatlantis/atlantis/server/events/vcs/gitea"
+	"github.com/runatlantis/atlantis/server/logging"
+	"github.com/runatlantis/atlantis/server/metrics"
+	"github.com/runatlantis/atlantis/server/recovery"
+	"github.com/uber-go/tally/v4"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
+)
+
+const (
+	ShutdownComment = "Atlantis server is shutting down, please try again later."
+)
+
+//go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_command_runner.go CommandRunner
+
+// CommandRunner is the first step after a command request has been parsed.
+type CommandRunner interface {
+	// RunCommentCommand is the first step after a command request has been parsed.
+	// It handles gathering additional information needed to execute the command
+	// and then calling the appropriate services to finish executing the command.
+	RunCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand)
+	RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User)
+}
+
+//go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_github_pull_getter.go GithubPullGetter
+
+// GithubPullGetter makes API calls to get pull requests.
+type GithubPullGetter interface {
+	// GetPullRequest gets the pull request with id pullNum for the repo.
+	GetPullRequest(logger logging.SimpleLogging, repo models.Repo, pullNum int) (*github.PullRequest, error)
+}
+
+//go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_azuredevops_pull_getter.go AzureDevopsPullGetter
+
+// AzureDevopsPullGetter makes API calls to get pull requests.
+type AzureDevopsPullGetter interface {
+	// GetPullRequest gets the pull request with id pullNum for the repo.
+	GetPullRequest(logger logging.SimpleLogging, repo models.Repo, pullNum int) (*azuredevops.GitPullRequest, error)
+}
+
+//go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_gitlab_merge_request_getter.go GitlabMergeRequestGetter
+
+// GitlabMergeRequestGetter makes API calls to get merge requests.
+type GitlabMergeRequestGetter interface {
+	// GetMergeRequest gets the pull request with the id pullNum for the repo.
+	GetMergeRequest(logger logging.SimpleLogging, repoFullName string, pullNum int) (*gitlab.MergeRequest, error)
+}
+
+// CommentCommandRunner runs individual command workflows.
+type CommentCommandRunner interface {
+	Run(*command.Context, *CommentCommand)
+}
+
+type PreWorkflowHooksSkipper interface {
+	ShouldSkipPreWorkflowHooks(*command.Context, *CommentCommand) bool
+}
+
+func buildCommentCommandRunner(
+	cmdRunner *DefaultCommandRunner,
+	cmdName command.Name,
+) CommentCommandRunner {
+	// panic here, we want to fail fast and hard since
+	// this would be an internal service configuration error.
+	runner, ok := cmdRunner.CommentCommandRunnerByCmd[cmdName]
+
+	if !ok {
+		panic(fmt.Sprintf("command runner not configured for command %s", cmdName.String()))
+	}
+
+	return runner
+}
+
+func shouldSkipPreWorkflowHooks(ctx *command.Context, cmdRunner CommentCommandRunner, cmd *CommentCommand) bool {
+	skipper, ok := cmdRunner.(PreWorkflowHooksSkipper)
+	return ok && skipper.ShouldSkipPreWorkflowHooks(ctx, cmd)
+}
+
+func preWorkflowHooksConfigured(runner PreWorkflowHooksCommandRunner, ctx *command.Context) bool {
+	checker, ok := runner.(PreWorkflowHooksConfiguredChecker)
+	return ok && checker.HasPreWorkflowHooks(ctx)
+}
+
+// DefaultCommandRunner is the first step when processing a comment command.
+type DefaultCommandRunner struct {
+	VCSClient                vcs.Client `validate:"required"`
+	GithubPullGetter         GithubPullGetter
+	AzureDevopsPullGetter    AzureDevopsPullGetter
+	GitlabMergeRequestGetter GitlabMergeRequestGetter
+	GiteaPullGetter          *gitea.Client
+	// User config option: Disables autoplan when a pull request is opened or updated.
+	DisableAutoplan      bool
+	DisableAutoplanLabel string
+	EventParser          EventParsing
+	// User config option: Fail and do not run the Atlantis command request if any of the pre workflow hooks error
+	FailOnPreWorkflowHookError bool
+	Logger                     logging.SimpleLogging `validate:"required"`
+	GlobalCfg                  valid.GlobalCfg       `validate:"required"`
+	StatsScope                 tally.Scope           `validate:"required"`
+	// User config option: controls whether to operate on pull requests from forks.
+	AllowForkPRs bool
+	// ParallelPoolSize controls the size of the wait group used to run
+	// parallel plans and applies (if enabled).
+	ParallelPoolSize int
+	// AllowForkPRsFlag is the name of the flag that controls fork PR's. We use
+	// this in our error message back to the user on a forked PR so they know
+	// how to enable this functionality.
+	AllowForkPRsFlag string
+	// User config option: controls whether to comment on Fork PRs when AllowForkPRs = False
+	SilenceForkPRErrors bool
+	// SilenceForkPRErrorsFlag is the name of the flag that controls fork PR's. We use
+	// this in our error message back to the user on a forked PR so they know
+	// how to disable error comment
+	SilenceForkPRErrorsFlag string
+	// SilenceVCSStatusNoProjects is whether to set commit status if no projects are found
+	SilenceVCSStatusNoProjects     bool
+	CommentCommandRunnerByCmd      map[command.Name]CommentCommandRunner `validate:"required"`
+	Drainer                        *Drainer                              `validate:"required"`
+	PreWorkflowHooksCommandRunner  PreWorkflowHooksCommandRunner         `validate:"required"`
+	PostWorkflowHooksCommandRunner PostWorkflowHooksCommandRunner        `validate:"required"`
+	PullStatusFetcher              PullStatusFetcher                     `validate:"required"`
+	TeamAllowlistChecker           command.TeamAllowlistChecker          `validate:"required"`
+	VarFileAllowlistChecker        *VarFileAllowlistChecker              `validate:"required"`
+	CommitStatusUpdater            CommitStatusUpdater                   `validate:"required"`
+}
+
+// RunAutoplanCommand runs plan and policy_checks when a pull request is opened or updated.
+func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User) {
+	if opStarted := c.Drainer.StartOp(); !opStarted {
+		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pull.Num, ShutdownComment, command.Plan.String()); commentErr != nil {
+			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
+		}
+		return
+	}
+	defer c.Drainer.OpDone()
+
+	log := c.buildLogger(baseRepo.FullName, pull.Num)
+	defer c.logPanics(baseRepo, pull.Num, log)
+	status, err := c.PullStatusFetcher.GetPullStatus(pull)
+
+	if err != nil {
+		log.Err("Unable to fetch pull status, this is likely a bug: %s", err)
+	}
+
+	scope := c.StatsScope.SubScope("autoplan")
+	timer := scope.Timer(metrics.ExecutionTimeMetric).Start()
+	defer timer.Stop()
+
+	// Check if the user who triggered the autoplan has permissions to run 'plan'.
+	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
+		err := c.fetchUserTeams(log, baseRepo, &user)
+		if err != nil {
+			log.Err("Unable to fetch user teams: %s", err)
+			return
+		}
+		directUserTeams := append([]string(nil), user.Teams...)
+
+		ok, err := c.checkUserPermissions(baseRepo, &user, "plan")
+		if err != nil {
+			log.Err("Unable to check user permissions: %s", err)
+			return
+		}
+		if !ok {
+			return
+		}
+		c.addPolicyCheckHierarchyTeamsForPlan(baseRepo, &user, command.Plan, directUserTeams)
+	}
+
+	ctx := &command.Context{
+		User:       user,
+		Log:        log,
+		Scope:      scope,
+		Pull:       pull,
+		HeadRepo:   headRepo,
+		PullStatus: status,
+		Trigger:    command.AutoTrigger,
+	}
+	if !c.validateCtxAndComment(ctx, command.Autoplan, true) {
+		return
+	}
+	if c.DisableAutoplan {
+		return
+	}
+	if len(c.DisableAutoplanLabel) > 0 {
+		labels, err := c.VCSClient.GetPullLabels(ctx.Log, baseRepo, pull)
+		if err != nil {
+			ctx.Log.Err("Unable to get VCS pull/merge request labels: %s. Proceeding with autoplan.", err)
+		} else if slices.Contains(labels, c.DisableAutoplanLabel) {
+			ctx.Log.Info("Pull/merge request has disable auto plan label '%s' so not running autoplan.", c.DisableAutoplanLabel)
+			return
+		}
+	}
+
+	ctx.Log.Info("Running autoplan...")
+	cmd := &CommentCommand{
+		Name: command.Autoplan,
+	}
+
+	cmdRunner := buildCommentCommandRunner(c, command.Plan)
+	if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
+		return
+	}
+
+	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
+
+	if preWorkflowHooksErr != nil {
+		if c.FailOnPreWorkflowHookError {
+			ctx.Log.Err("'fail-on-pre-workflow-hook-error' set, so not running %s command.", command.Plan)
+
+			// Create comment on pull request about the pre-workflow hook failure
+			errMsg := fmt.Sprintf("```\nError: Pre-workflow hook failed: %s\n```", preWorkflowHooksErr.Error())
+			if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, errMsg, ""); err != nil {
+				ctx.Log.Warn("Unable to create comment about pre-workflow hook failure: %s", err)
+			}
+
+			if err := c.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, command.Plan); err != nil {
+				ctx.Log.Warn("Unable to update plan commit status: %s", err)
+			}
+
+			return
+		}
+
+		ctx.Log.Err("'fail-on-pre-workflow-hook-error' not set so running %s command.", command.Plan)
+	}
+
+	autoPlanRunner := buildCommentCommandRunner(c, command.Plan)
+
+	autoPlanRunner.Run(ctx, nil)
+
+	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
+}
+
+// commentUserDoesNotHavePermissions comments on the pull request that the user
+// is not allowed to execute the command.
+func (c *DefaultCommandRunner) commentUserDoesNotHavePermissions(baseRepo models.Repo, pullNum int, user models.User, cmd *CommentCommand) {
+	errMsg := fmt.Sprintf("```\nError: User @%s does not have permissions to execute '%s' command.\n```", user.Username, cmd.Name.String())
+	if err := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, errMsg, ""); err != nil {
+		c.Logger.Err("unable to comment on pull request: %s", err)
+	}
+}
+
+// fetchDescendantTeams fetches all descendant team slugs for the given team up to maxDepth
+// levels deep using an iterative BFS with a visited set to avoid duplicate API calls and
+// handle any cycles in unexpected hierarchy configurations.
+func fetchDescendantTeams(fetcher vcs.Client, logger logging.SimpleLogging, repo models.Repo, teamSlug string, maxDepth int) ([]string, error) {
+	if maxDepth <= 0 {
+		return nil, nil
+	}
+
+	type queueItem struct {
+		slug  string
+		depth int
+	}
+
+	visited := map[string]struct{}{teamSlug: {}}
+	queue := []queueItem{{slug: teamSlug, depth: 0}}
+	var result []string
+
+	for i := 0; i < len(queue); i++ {
+		current := queue[i]
+
+		if current.depth >= maxDepth {
+			continue
+		}
+
+		children, err := fetcher.GetChildTeams(logger, repo, current.slug)
+		if err != nil {
+			if current.slug == teamSlug {
+				return nil, err
+			}
+			logger.Warn("Could not fetch child teams for '%s': %s", current.slug, err)
+			continue
+		}
+
+		for _, child := range children {
+			if _, ok := visited[child]; ok {
+				continue
+			}
+			visited[child] = struct{}{}
+			result = append(result, child)
+			queue = append(queue, queueItem{slug: child, depth: current.depth + 1})
+		}
+	}
+
+	return result, nil
+}
+
+func teamSet(teams []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(teams))
+	for _, team := range teams {
+		result[strings.ToLower(team)] = struct{}{}
+	}
+	return result
+}
+
+func (c *DefaultCommandRunner) addHierarchyTeamsForCommand(repo models.Repo, user *models.User, cmdName string) {
+	c.addHierarchyTeamsForCommandForTeams(repo, user, cmdName, user.Teams)
+}
+
+func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.Repo, user *models.User, cmdName string, teams []string) {
+	if c.TeamAllowlistChecker == nil || !c.TeamAllowlistChecker.HasRules() {
+		return
+	}
+
+	ctx := models.TeamAllowlistCheckerContext{
+		BaseRepo:    repo,
+		CommandName: cmdName,
+		Log:         c.Logger,
+		Pull:        models.PullRequest{},
+		User:        *user,
+		Verbose:     false,
+		API:         false,
+	}
+
+	// Only direct user teams should authorize hierarchy grants. Parent teams inferred
+	// during this pass are appended for downstream direct-membership filters, not for
+	// chaining additional hierarchy grants.
+	directUserTeams := teamSet(teams)
+	currentUserTeams := teamSet(user.Teams)
+
+	const maxHierarchyDepth = 20
+	for _, allowedTeam := range c.TeamAllowlistChecker.AllTeams() {
+		if allowedTeam == "*" {
+			continue
+		}
+		normalizedAllowedTeam := strings.ToLower(allowedTeam)
+		if _, ok := currentUserTeams[normalizedAllowedTeam]; ok {
+			continue
+		}
+		if !c.TeamAllowlistChecker.IsCommandAllowedForTeam(ctx, allowedTeam, cmdName) {
+			continue
+		}
+		descendants, err := fetchDescendantTeams(c.VCSClient, c.Logger, repo, allowedTeam, maxHierarchyDepth)
+		if err != nil {
+			c.Logger.Warn("Could not fetch child teams for '%s': %s", allowedTeam, err)
+			continue
+		}
+		for _, descendant := range descendants {
+			if _, ok := directUserTeams[strings.ToLower(descendant)]; !ok {
+				continue
+			}
+			user.Teams = append(user.Teams, allowedTeam)
+			currentUserTeams[normalizedAllowedTeam] = struct{}{}
+			break
+		}
+	}
+}
+
+func (c *DefaultCommandRunner) addPolicyCheckHierarchyTeamsForPlan(repo models.Repo, user *models.User, cmdName command.Name, directUserTeams []string) {
+	if cmdName != command.Plan {
+		return
+	}
+	c.addHierarchyTeamsForCommandForTeams(repo, user, command.PolicyCheck.String(), directUserTeams)
+}
+
+// checkUserPermissions checks if the user has permissions to execute the command.
+// It first checks direct team membership against the allowlist. If that fails,
+// it expands each allowlisted team to include all its descendant teams (up to
+// 20 levels deep) via GetChildTeams on the VCS client and re-checks.
+// Non-GitHub VCS providers return nil from GetChildTeams, so the expansion
+// loop is effectively a no-op for them.
+// When a match is found via hierarchy, the matched allowlisted parent team is appended to
+// user.Teams so that subsequent per-project allowlist checks (which use direct membership
+// only) also pass.
+func (c *DefaultCommandRunner) checkUserPermissions(repo models.Repo, user *models.User, cmdName string) (bool, error) {
+	if c.TeamAllowlistChecker == nil || !c.TeamAllowlistChecker.HasRules() {
+		// allowlist restriction is not enabled
+		return true, nil
+	}
+	ctx := models.TeamAllowlistCheckerContext{
+		BaseRepo:    repo,
+		CommandName: cmdName,
+		Log:         c.Logger,
+		Pull:        models.PullRequest{},
+		User:        *user,
+		Verbose:     false,
+		API:         false,
+	}
+
+	// Fast path: user is a direct member of an allowlisted team.
+	if c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
+		return true, nil
+	}
+
+	// Slow path: check if the user belongs to a descendant team of any allowlisted team.
+	c.addHierarchyTeamsForCommand(repo, user, cmdName)
+	ctx.User = *user
+	if c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// checkVarFilesInPlanCommandAllowlisted checks if paths in a 'plan' command are allowlisted.
+func (c *DefaultCommandRunner) checkVarFilesInPlanCommandAllowlisted(cmd *CommentCommand) error {
+	if cmd == nil || cmd.CommandName() != command.Plan {
+		return nil
+	}
+
+	return c.VarFileAllowlistChecker.Check(cmd.Flags)
+}
+
+func (c *DefaultCommandRunner) validateCommentCommand(ctx *command.Context, baseRepo models.Repo, pullNum int, user models.User, cmd *CommentCommand, shouldComment bool) bool {
+	// Check if the user who commented has the permissions to execute the 'plan' or 'apply' commands
+	if c.TeamAllowlistChecker != nil && c.TeamAllowlistChecker.HasRules() {
+		err := c.fetchUserTeams(ctx.Log, baseRepo, &user)
+		if err != nil {
+			c.Logger.Err("Unable to fetch user teams: %s", err)
+			return false
+		}
+		directUserTeams := append([]string(nil), user.Teams...)
+
+		ok, err := c.checkUserPermissions(baseRepo, &user, cmd.Name.String())
+		if err != nil {
+			c.Logger.Err("Unable to check user permissions: %s", err)
+			return false
+		}
+		if !ok {
+			if shouldComment {
+				c.commentUserDoesNotHavePermissions(baseRepo, pullNum, user, cmd)
+			}
+			return false
+		}
+		c.addPolicyCheckHierarchyTeamsForPlan(baseRepo, &user, cmd.Name, directUserTeams)
+		ctx.User = user
+	}
+
+	// Check if the provided var files in a 'plan' command are allowlisted
+	if err := c.checkVarFilesInPlanCommandAllowlisted(cmd); err != nil {
+		if shouldComment {
+			errMsg := fmt.Sprintf("```\n%s\n```", err.Error())
+			if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, errMsg, ""); commentErr != nil {
+				c.Logger.Err("unable to comment on pull request: %s", commentErr)
+			}
+		}
+		return false
+	}
+
+	return true
+}
+
+// RunCommentCommand executes the command.
+// We take in a pointer for maybeHeadRepo because for some events there isn't
+// enough data to construct the Repo model and callers might want to wait until
+// the event is further validated before making an additional (potentially
+// wasteful) call to get the necessary data.
+func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand) {
+	if opStarted := c.Drainer.StartOp(); !opStarted {
+		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, ShutdownComment, ""); commentErr != nil {
+			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
+		}
+		return
+	}
+	defer c.Drainer.OpDone()
+
+	log := c.buildLogger(baseRepo.FullName, pullNum)
+	defer c.logPanics(baseRepo, pullNum, log)
+
+	scope := c.StatsScope.SubScope("comment")
+
+	if cmd != nil {
+		scope = scope.SubScope(cmd.Name.String())
+	}
+	timer := scope.Timer(metrics.ExecutionTimeMetric).Start()
+	defer timer.Stop()
+
+	headRepo, pull, err := c.ensureValidRepoMetadata(baseRepo, maybeHeadRepo, maybePull, user, pullNum, log)
+	if err != nil {
+		return
+	}
+
+	status, err := c.PullStatusFetcher.GetPullStatus(pull)
+
+	if err != nil {
+		log.Err("Unable to fetch pull status, this is likely a bug: %s", err)
+	}
+
+	ctx := &command.Context{
+		User:                 user,
+		Log:                  log,
+		Pull:                 pull,
+		PullStatus:           status,
+		HeadRepo:             headRepo,
+		Scope:                scope,
+		Trigger:              command.CommentTrigger,
+		PolicySet:            cmd.PolicySet,
+		ClearPolicyApproval:  cmd.ClearPolicyApproval,
+		TeamAllowlistChecker: c.TeamAllowlistChecker,
+	}
+
+	if !c.validateCtxAndComment(ctx, cmd.Name, true) {
+		return
+	}
+
+	cmdRunner := buildCommentCommandRunner(c, cmd.CommandName())
+	targetInitiallyIgnored := shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd)
+	if targetInitiallyIgnored {
+		ctx.CommandSkipped = false
+	}
+
+	if !c.validateCommentCommand(ctx, baseRepo, pullNum, user, cmd, !targetInitiallyIgnored) {
+		return
+	}
+
+	preWorkflowHooksMayUpdateRepo := preWorkflowHooksConfigured(c.PreWorkflowHooksCommandRunner, ctx)
+	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
+	if targetInitiallyIgnored {
+		ctx.CommandSkipped = false
+		if !preWorkflowHooksMayUpdateRepo {
+			return
+		}
+		ctx.PreferLocalRepoCfgForTargetedIgnore = true
+		if shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd) {
+			return
+		}
+	}
+	if preWorkflowHooksErr != nil {
+		if c.FailOnPreWorkflowHookError {
+			ctx.Log.Err("'fail-on-pre-workflow-hook-error' set, so not running %s command.", cmd.Name.String())
+
+			// Create comment on pull request about the pre-workflow hook failure
+			errMsg := fmt.Sprintf("```\nError: Pre-workflow hook failed: %s\n```", preWorkflowHooksErr.Error())
+			if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, errMsg, ""); err != nil {
+				ctx.Log.Warn("Unable to create comment about pre-workflow hook failure: %s", err)
+			}
+
+			// Update the plan or apply commit status to failed
+			switch cmd.Name {
+			case command.Plan:
+				if err := c.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, command.Plan); err != nil {
+					ctx.Log.Warn("unable to update plan commit status: %s", err)
+				}
+			case command.Apply:
+				if err := c.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, command.Apply); err != nil {
+					ctx.Log.Warn("unable to update apply commit status: %s", err)
+				}
+			}
+
+			return
+		}
+
+		ctx.Log.Err("'fail-on-pre-workflow-hook-error' not set so running %s command.", cmd.Name.String())
+	}
+
+	cmdRunner.Run(ctx, cmd)
+	if ctx.CommandSkipped {
+		return
+	}
+
+	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
+}
+
+func (c *DefaultCommandRunner) getGithubData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {
+	if c.GithubPullGetter == nil {
+		return models.PullRequest{}, models.Repo{}, errors.New("atlantis not configured to support GitHub")
+	}
+	ghPull, err := c.GithubPullGetter.GetPullRequest(logger, baseRepo, pullNum)
+	if err != nil {
+		return models.PullRequest{}, models.Repo{}, fmt.Errorf("making pull request API call to GitHub: %w", err)
+	}
+	pull, _, headRepo, err := c.EventParser.ParseGithubPull(logger, ghPull)
+	if err != nil {
+		return pull, headRepo, fmt.Errorf("extracting required fields from comment data: %w", err)
+	}
+	return pull, headRepo, nil
+}
+
+func (c *DefaultCommandRunner) getGiteaData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {
+	if c.GiteaPullGetter == nil {
+		return models.PullRequest{}, models.Repo{}, errors.New("atlantis not configured to support Gitea")
+	}
+	giteaPull, err := c.GiteaPullGetter.GetPullRequest(logger, baseRepo, pullNum)
+	if err != nil {
+		return models.PullRequest{}, models.Repo{}, fmt.Errorf("making pull request API call to Gitea: %w", err)
+	}
+	pull, _, headRepo, err := c.EventParser.ParseGiteaPull(giteaPull)
+	if err != nil {
+		return pull, headRepo, fmt.Errorf("extracting required fields from comment data: %w", err)
+	}
+	return pull, headRepo, nil
+}
+
+func (c *DefaultCommandRunner) getGitlabData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, error) {
+	if c.GitlabMergeRequestGetter == nil {
+		return models.PullRequest{}, errors.New("atlantis not configured to support GitLab")
+	}
+	mr, err := c.GitlabMergeRequestGetter.GetMergeRequest(logger, baseRepo.FullName, pullNum)
+	if err != nil {
+		return models.PullRequest{}, fmt.Errorf("making merge request API call to GitLab: %w", err)
+	}
+	pull := c.EventParser.ParseGitlabMergeRequest(mr, baseRepo)
+	return pull, nil
+}
+
+func (c *DefaultCommandRunner) getAzureDevopsData(logger logging.SimpleLogging, baseRepo models.Repo, pullNum int) (models.PullRequest, models.Repo, error) {
+	if c.AzureDevopsPullGetter == nil {
+		return models.PullRequest{}, models.Repo{}, errors.New("atlantis not configured to support Azure DevOps")
+	}
+	adPull, err := c.AzureDevopsPullGetter.GetPullRequest(logger, baseRepo, pullNum)
+	if err != nil {
+		return models.PullRequest{}, models.Repo{}, fmt.Errorf("making pull request API call to Azure DevOps: %w", err)
+	}
+	pull, _, headRepo, err := c.EventParser.ParseAzureDevopsPull(adPull)
+	if err != nil {
+		return pull, headRepo, fmt.Errorf("extracting required fields from comment data: %w", err)
+	}
+	return pull, headRepo, nil
+}
+
+func (c *DefaultCommandRunner) buildLogger(repoFullName string, pullNum int) logging.SimpleLogging {
+
+	return c.Logger.WithHistory(
+		"repo", repoFullName,
+		"pull", strconv.Itoa(pullNum),
+	)
+}
+
+func (c *DefaultCommandRunner) ensureValidRepoMetadata(
+	baseRepo models.Repo,
+	maybeHeadRepo *models.Repo,
+	maybePull *models.PullRequest,
+	_ models.User,
+	pullNum int,
+	log logging.SimpleLogging,
+) (headRepo models.Repo, pull models.PullRequest, err error) {
+	if maybeHeadRepo != nil {
+		headRepo = *maybeHeadRepo
+	}
+
+	switch baseRepo.VCSHost.Type {
+	case models.Github:
+		pull, headRepo, err = c.getGithubData(log, baseRepo, pullNum)
+	case models.Gitlab:
+		pull, err = c.getGitlabData(log, baseRepo, pullNum)
+	case models.BitbucketCloud, models.BitbucketServer:
+		if maybePull == nil {
+			err = errors.New("pull request should not be nil–this is a bug")
+			break
+		}
+		pull = *maybePull
+	case models.AzureDevops:
+		pull, headRepo, err = c.getAzureDevopsData(log, baseRepo, pullNum)
+	case models.Gitea:
+		pull, headRepo, err = c.getGiteaData(log, baseRepo, pullNum)
+	default:
+		err = errors.New("unknown VCS type–this is a bug")
+	}
+
+	if err != nil {
+		log.Err("%s", err.Error())
+		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pullNum, fmt.Sprintf("`Error: %s`", err), ""); commentErr != nil {
+			log.Err("unable to comment: %s", commentErr)
+		}
+	}
+
+	return
+}
+
+func (c *DefaultCommandRunner) fetchUserTeams(logger logging.SimpleLogging, repo models.Repo, user *models.User) error {
+	teams, err := c.VCSClient.GetTeamNamesForUser(logger, repo, *user)
+	if err != nil {
+		return err
+	}
+
+	user.Teams = teams
+	return nil
+}
+
+func (c *DefaultCommandRunner) validateCtxAndComment(ctx *command.Context, commandName command.Name, shouldComment bool) bool {
+	if !c.AllowForkPRs && ctx.HeadRepo.Owner != ctx.Pull.BaseRepo.Owner {
+		if c.SilenceForkPRErrors || !shouldComment {
+			return false
+		}
+		ctx.Log.Info("command was run on a fork pull request which is disallowed")
+		if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, fmt.Sprintf("Atlantis commands can't be run on fork pull requests. To enable, set --%s  or, to disable this message, set --%s", c.AllowForkPRsFlag, c.SilenceForkPRErrorsFlag), ""); err != nil {
+			ctx.Log.Err("unable to comment: %s", err)
+		}
+		return false
+	}
+
+	if ctx.Pull.State != models.OpenPullState && commandName != command.Unlock {
+		ctx.Log.Info("command was run on closed pull request")
+		if shouldComment {
+			if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, "Atlantis commands can't be run on closed pull requests", ""); err != nil {
+				ctx.Log.Err("unable to comment: %s", err)
+			}
+		}
+		return false
+	}
+
+	repo := c.GlobalCfg.MatchingRepo(ctx.Pull.BaseRepo.ID())
+	if !repo.BranchMatches(ctx.Pull.BaseBranch) {
+		ctx.Log.Info("command was run on a pull request which doesn't match base branches")
+		// just ignore it to allow us to use any git workflows without malicious intentions.
+		return false
+	}
+	return true
+}
+
+// logPanics logs and creates a comment on the pull request for panics.
+func (c *DefaultCommandRunner) logPanics(baseRepo models.Repo, pullNum int, logger logging.SimpleLogging) {
+	if err := recover(); err != nil {
+		stack := recovery.Stack(3)
+		logger.Err("PANIC: %s\n%s", err, stack)
+		if commentErr := c.VCSClient.CreateComment(
+			logger,
+			baseRepo,
+			pullNum,
+			fmt.Sprintf("**Error: goroutine panic. This is a bug.**\n```\n%s\n%s```", err, stack),
+			"",
+		); commentErr != nil {
+			logger.Err("unable to comment: %s", commentErr)
+		}
+	}
+}
+
+var automergeComment = `Automatically merging because all plans have been successfully applied.`

@@ -1,0 +1,49 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/runatlantis/atlantis/server/events/command"
+)
+
+func NewPlanTypeStepRunnerDelegate(defaultRunner Runner, remotePlanRunner Runner) Runner {
+	return &planTypeStepRunnerDelegate{
+		defaultRunner:    defaultRunner,
+		remotePlanRunner: remotePlanRunner,
+	}
+}
+
+// planTypeStepRunnerDelegate delegates based on the type of plan, ie. remote backend which doesn't support certain functions
+type planTypeStepRunnerDelegate struct {
+	defaultRunner    Runner
+	remotePlanRunner Runner
+}
+
+func (p *planTypeStepRunnerDelegate) isRemotePlan(planFile string) (bool, error) {
+	data, err := os.ReadFile(planFile)
+
+	if err != nil {
+		return false, fmt.Errorf("unable to read %s: %w", planFile, err)
+	}
+
+	return IsRemotePlan(data), nil
+}
+
+func (p *planTypeStepRunnerDelegate) Run(ctx command.ProjectContext, extraArgs []string, path string, envs map[string]string) (string, error) {
+	planFile := GetPlanFilePath(ctx, path)
+	remotePlan, err := p.isRemotePlan(planFile)
+
+	if err != nil {
+		return "", err
+	}
+
+	if remotePlan {
+		return p.remotePlanRunner.Run(ctx, extraArgs, path, envs)
+	}
+
+	return p.defaultRunner.Run(ctx, extraArgs, path, envs)
+}

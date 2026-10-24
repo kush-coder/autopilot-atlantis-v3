@@ -1,0 +1,451 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package bitbucketcloud holds code for Bitbucket Cloud aka (bitbucket.org).
+// It is separate from bitbucketserver because Bitbucket Server has different
+// APIs.
+package bitbucketcloud
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"unicode/utf8"
+
+	validator "github.com/go-playground/validator/v10"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
+)
+
+const BaseURL = "https://api.bitbucket.org"
+
+type Client struct {
+	httpClient  *http.Client
+	username    string // Used for git operations
+	apiUser     string // Used for API calls (Basic Auth)
+	password    string
+	BaseURL     string
+	atlantisURL string
+}
+
+// NewClient builds a bitbucket cloud client. atlantisURL is the
+// URL for Atlantis that will be linked to from the build status icons. This
+// linking is annoying because we don't have anywhere good to link but a URL is
+// required.
+// username is used for git operations, apiUser is used for API authentication (Basic Auth).
+// If apiUser is empty, it will default to username for backward compatibility.
+func New(httpClient *http.Client, username string, password string, apiUser string, atlantisURL string) *Client {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	// Use apiUser for API calls if provided, otherwise fall back to username for backward compatibility
+	if apiUser == "" {
+		apiUser = username
+	}
+	return &Client{
+		httpClient:  httpClient,
+		username:    username,
+		apiUser:     apiUser,
+		password:    password,
+		BaseURL:     BaseURL,
+		atlantisURL: atlantisURL,
+	}
+}
+
+var MY_UUID = ""
+
+// GetModifiedFiles returns the names of files that were modified in the merge request
+// relative to the repo root, e.g. parent/child/file.txt.
+func (b *Client) GetModifiedFiles(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) ([]string, error) {
+	var files []string
+
+	nextPageURL := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/diffstat", b.BaseURL, repo.FullName, pull.Num)
+	// We'll only loop 1000 times as a safety measure.
+	maxLoops := 1000
+	for range maxLoops {
+		resp, err := b.makeRequest("GET", nextPageURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		var diffStat DiffStat
+		if err := json.Unmarshal(resp, &diffStat); err != nil {
+			return nil, fmt.Errorf("parsing response %q: %w", string(resp), err)
+		}
+		if err := validator.New().Struct(diffStat); err != nil {
+			return nil, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
+		}
+		for _, v := range diffStat.Values {
+			if v.Old != nil {
+				files = append(files, *v.Old.Path)
+			}
+			if v.New != nil {
+				files = append(files, *v.New.Path)
+			}
+		}
+		if diffStat.Next == nil || *diffStat.Next == "" {
+			break
+		}
+		if err := b.validateNextPageURL(*diffStat.Next); err != nil {
+			return nil, fmt.Errorf("getting modified files: %w", err)
+		}
+		nextPageURL = *diffStat.Next
+	}
+	hash := make(map[string]bool)
+	var unique []string
+	for _, f := range files {
+		if !hash[f] {
+			unique = append(unique, f)
+			hash[f] = true
+		}
+	}
+	return unique, nil
+}
+
+// CreateComment creates a comment on the merge request.
+func (b *Client) CreateComment(logger logging.SimpleLogging, repo models.Repo, pullNum int, comment string, _ string) error {
+	// NOTE: I tried to find the maximum size of a comment for bitbucket.org but
+	// I got up to 200k chars without issue so for now I'm not going to bother
+	// to detect this.
+	bodyBytes, err := json.Marshal(map[string]map[string]string{"content": {
+		"raw": comment,
+	}})
+	if err != nil {
+		return fmt.Errorf("json encoding: %w", err)
+	}
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/comments", b.BaseURL, repo.FullName, pullNum)
+	_, err = b.makeRequest("POST", path, bytes.NewBuffer(bodyBytes))
+	return err
+}
+
+// UpdateComment updates the body of a comment on the merge request.
+func (b *Client) ReactToComment(_ logging.SimpleLogging, _ models.Repo, _ int, _ int64, _ string) error {
+	// TODO: Bitbucket support for reactions
+	return nil
+}
+
+func (b *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo models.Repo, pullNum int, command string, _ string) error {
+	// there is no way to hide comment, so delete them instead
+	me, err := b.GetMyUUID()
+	if err != nil {
+		return fmt.Errorf("getting my uuid, check required scope of the auth token: %w", err)
+	}
+	logger.Debug("My bitbucket user UUID is: %s", me)
+
+	comments, err := b.GetPullRequestComments(repo, pullNum)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range comments {
+		logger.Debug("Comment is %v", c.Content.Raw)
+		if strings.EqualFold(*c.User.UUID, me) {
+			// do the same crude filtering as github client does
+			body := strings.Split(c.Content.Raw, "\n")
+			logger.Debug("Body is %v", body)
+			if len(body) == 0 {
+				continue
+			}
+			firstLine := strings.ToLower(body[0])
+			if strings.Contains(firstLine, strings.ToLower(command)) {
+				// we found our old comment that references that command
+				logger.Debug("Deleting comment with id %d", *c.ID)
+				err = b.DeletePullRequestComment(repo, pullNum, *c.ID)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (b *Client) DeletePullRequestComment(repo models.Repo, pullNum int, commentId int) error {
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/comments/%d", b.BaseURL, repo.FullName, pullNum, commentId)
+	_, err := b.makeRequest("DELETE", path, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Client) GetPullRequestComments(repo models.Repo, pullNum int) (comments []PullRequestComment, err error) {
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/comments", b.BaseURL, repo.FullName, pullNum)
+	res, err := b.makeRequest("GET", path, nil)
+	if err != nil {
+		return comments, err
+	}
+
+	var pulls PullRequestComments
+	if err := json.Unmarshal(res, &pulls); err != nil {
+		return comments, fmt.Errorf("parsing response %q: %w", string(res), err)
+	}
+	return pulls.Values, nil
+}
+
+func (b *Client) GetMyUUID() (uuid string, err error) {
+	if MY_UUID == "" {
+		path := fmt.Sprintf("%s/2.0/user", b.BaseURL)
+		resp, err := b.makeRequest("GET", path, nil)
+
+		if err != nil {
+			return uuid, err
+		}
+
+		var user User
+		if err := json.Unmarshal(resp, &user); err != nil {
+			return uuid, fmt.Errorf("parsing response %q: %w", string(resp), err)
+		}
+
+		if err := validator.New().Struct(user); err != nil {
+			return uuid, fmt.Errorf("response %q was missing a field: %w", string(resp), err)
+		}
+
+		uuid = *user.UUID
+		MY_UUID = uuid
+
+		return uuid, nil
+	} else {
+		return MY_UUID, nil
+	}
+}
+
+// PullIsApproved returns true if the merge request was approved.
+func (b *Client) PullIsApproved(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) (approvalStatus models.ApprovalStatus, err error) {
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d", b.BaseURL, repo.FullName, pull.Num)
+	resp, err := b.makeRequest("GET", path, nil)
+	if err != nil {
+		return approvalStatus, err
+	}
+	var pullResp PullRequest
+	if err := json.Unmarshal(resp, &pullResp); err != nil {
+		return approvalStatus, fmt.Errorf("parsing response %q: %w", string(resp), err)
+	}
+	if err := validator.New().Struct(pullResp); err != nil {
+		return approvalStatus, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
+	}
+	authorUUID := *pullResp.Author.UUID
+	for _, participant := range pullResp.Participants {
+		// Bitbucket allows the author to approve their own pull request. This
+		// defeats the purpose of approvals so we don't count that approval.
+		if *participant.Approved && *participant.User.UUID != authorUUID {
+			return models.ApprovalStatus{
+				IsApproved: true,
+			}, nil
+		}
+	}
+	return approvalStatus, nil
+}
+
+func (b *Client) GetPullRequestHeadCommit(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) (string, error) {
+	livePull, err := b.GetPullRequestIdentity(logger, repo, pull)
+	if err != nil {
+		return "", err
+	}
+	return livePull.HeadCommit, nil
+}
+
+func (b *Client) GetPullRequestIdentity(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) (models.PullRequest, error) {
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d", b.BaseURL, repo.FullName, pull.Num)
+	resp, err := b.makeRequest("GET", path, nil)
+	if err != nil {
+		return models.PullRequest{}, err
+	}
+	var pullResp PullRequest
+	if err := json.Unmarshal(resp, &pullResp); err != nil {
+		return models.PullRequest{}, fmt.Errorf("parsing response %q: %w", string(resp), err)
+	}
+	if err := validator.New().Struct(pullResp); err != nil {
+		return models.PullRequest{}, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
+	}
+	pull.HeadCommit = *pullResp.Source.Commit.Hash
+	pull.BaseBranch = *pullResp.Destination.Branch.Name
+	return pull, nil
+}
+
+// PullIsMergeable returns true if the merge request has no conflicts and can be merged.
+func (b *Client) PullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, _ string, _ []string) (models.MergeableStatus, error) {
+	nextPageURL := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/diffstat", b.BaseURL, repo.FullName, pull.Num)
+	// We'll only loop 1000 times as a safety measure.
+	maxLoops := 1000
+	for range maxLoops {
+		resp, err := b.makeRequest("GET", nextPageURL, nil)
+		if err != nil {
+			return models.MergeableStatus{}, err
+		}
+		var diffStat DiffStat
+		if err := json.Unmarshal(resp, &diffStat); err != nil {
+			return models.MergeableStatus{}, fmt.Errorf("parsing response %q: %w", string(resp), err)
+		}
+		if err := validator.New().Struct(diffStat); err != nil {
+			return models.MergeableStatus{}, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
+		}
+		for _, v := range diffStat.Values {
+			// These values are undocumented, found via manual testing.
+			if *v.Status == "merge conflict" || *v.Status == "local deleted" {
+				return models.MergeableStatus{
+					IsMergeable: false,
+				}, nil
+			}
+		}
+		if diffStat.Next == nil || *diffStat.Next == "" {
+			break
+		}
+		if err := b.validateNextPageURL(*diffStat.Next); err != nil {
+			return models.MergeableStatus{}, fmt.Errorf("checking pull mergeability: %w", err)
+		}
+		nextPageURL = *diffStat.Next
+	}
+	return models.MergeableStatus{
+		IsMergeable: true,
+	}, nil
+}
+
+// UpdateStatus updates the status of a commit.
+func (b *Client) UpdateStatus(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, status models.CommitStatus, src string, description string, url string) error {
+	bbState := "FAILED"
+	switch status {
+	case models.PendingCommitStatus:
+		bbState = "INPROGRESS"
+	case models.SuccessCommitStatus:
+		bbState = "SUCCESSFUL"
+	case models.FailedCommitStatus:
+		bbState = "FAILED"
+	}
+
+	logger.Info("Updating BitBucket commit status for '%s' to '%s'", src, bbState)
+
+	// URL is a required field for bitbucket statuses. We default to the
+	// Atlantis server's URL.
+	if url == "" {
+		url = b.atlantisURL
+	}
+
+	// Ensure key has at most 40 characters
+	if utf8.RuneCountInString(src) > 40 {
+		src = fmt.Sprintf("%.37s...", src)
+	}
+
+	bodyBytes, err := json.Marshal(map[string]string{
+		"key":         src,
+		"url":         url,
+		"state":       bbState,
+		"description": description,
+	})
+
+	path := fmt.Sprintf("%s/2.0/repositories/%s/commit/%s/statuses/build", b.BaseURL, repo.FullName, pull.HeadCommit)
+	if err != nil {
+		return fmt.Errorf("json encoding: %w", err)
+	}
+	_, err = b.makeRequest("POST", path, bytes.NewBuffer(bodyBytes))
+	return err
+}
+
+// MergePull merges the pull request.
+func (b *Client) MergePull(logger logging.SimpleLogging, pull models.PullRequest, _ models.PullRequestOptions) error {
+	path := fmt.Sprintf("%s/2.0/repositories/%s/pullrequests/%d/merge", b.BaseURL, pull.BaseRepo.FullName, pull.Num)
+	_, err := b.makeRequest("POST", path, nil)
+	return err
+}
+
+// MarkdownPullLink specifies the character used in a pull request comment.
+func (b *Client) MarkdownPullLink(pull models.PullRequest) (string, error) {
+	return fmt.Sprintf("#%d", pull.Num), nil
+}
+
+// prepRequest adds auth and necessary headers.
+func (b *Client) prepRequest(method string, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	// Use ApiUser for API authentication, Username is for git operations
+	req.SetBasicAuth(b.apiUser, b.password)
+	if body != nil {
+		req.Header.Add("Content-Type", "application/json")
+	}
+	// Add this header to disable CSRF checks.
+	// See https://confluence.atlassian.com/cloudkb/xsrf-check-failed-when-calling-cloud-apis-826874382.html
+	req.Header.Add("X-Atlassian-Token", "no-check")
+	return req, nil
+}
+
+func (b *Client) DiscardReviews(_ logging.SimpleLogging, _ models.Repo, _ models.PullRequest) error {
+	// TODO implement
+	return nil
+}
+
+func (b *Client) makeRequest(method string, path string, reqBody io.Reader) ([]byte, error) {
+	req, err := b.prepRequest(method, path, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("constructing request: %w", err)
+	}
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() // nolint: errcheck
+	requestStr := fmt.Sprintf("%s %s", method, path)
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("making request %q unexpected status code: %d, body: %s", requestStr, resp.StatusCode, string(respBody))
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response from request %q: %w", requestStr, err)
+	}
+	return respBody, nil
+}
+
+// GetTeamNamesForUser returns the names of the teams or groups that the user belongs to (in the organization the repository belongs to).
+func (b *Client) GetTeamNamesForUser(_ logging.SimpleLogging, _ models.Repo, _ models.User) ([]string, error) {
+	return nil, nil
+}
+
+func (b *Client) SupportsSingleFileDownload(models.Repo) bool {
+	return false
+}
+
+// GetFileContent a repository file content from VCS (which support fetch a single file from repository)
+// The first return value indicates whether the repo contains a file or not
+// if BaseRepo had a file, its content will placed on the second return value
+func (b *Client) GetFileContent(_ logging.SimpleLogging, _ models.Repo, _ string, _ string) (bool, []byte, error) {
+	return false, []byte{}, fmt.Errorf("not implemented")
+}
+
+func (b *Client) GetCloneURL(_ logging.SimpleLogging, _ models.VCSHostType, _ string) (string, error) {
+	return "", fmt.Errorf("not yet implemented")
+}
+
+func (b *Client) GetPullLabels(_ logging.SimpleLogging, _ models.Repo, _ models.PullRequest) ([]string, error) {
+	return nil, fmt.Errorf("not yet implemented")
+}
+
+func (b *Client) GetChildTeams(_ logging.SimpleLogging, _ models.Repo, _ string) ([]string, error) {
+	return nil, nil
+}
+
+// validateNextPageURL checks that a pagination URL returned by the Bitbucket
+// API has the same origin as the configured base URL, preventing SSRF attacks
+// where a malicious server response could redirect requests to internal hosts.
+func (b *Client) validateNextPageURL(nextPageURL string) error {
+	parsedNext, err := url.Parse(nextPageURL)
+	if err != nil {
+		return fmt.Errorf("parsing next page URL %q: %w", nextPageURL, err)
+	}
+	parsedBase, err := url.Parse(b.BaseURL)
+	if err != nil {
+		return fmt.Errorf("parsing base URL %q: %w", b.BaseURL, err)
+	}
+	if !parsedNext.IsAbs() {
+		return fmt.Errorf("next page URL %q must be absolute", nextPageURL)
+	}
+	if !strings.EqualFold(parsedNext.Scheme, parsedBase.Scheme) || !strings.EqualFold(parsedNext.Host, parsedBase.Host) {
+		return fmt.Errorf("next page URL %q origin %q does not match base URL origin %q", nextPageURL, parsedNext.Scheme+"://"+parsedNext.Host, parsedBase.Scheme+"://"+parsedBase.Host)
+	}
+	return nil
+}

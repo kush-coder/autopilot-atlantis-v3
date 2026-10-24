@@ -1,0 +1,102 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package events
+
+import (
+	"embed"
+	"fmt"
+	"io/fs"
+	"sort"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+//go:embed testdata/fs
+var repos embed.FS
+
+func Test_findModuleDependants(t *testing.T) {
+
+	type args struct {
+		files                    fs.FS
+		autoplanModuleDependants string
+	}
+	a, err := fs.Sub(repos, "testdata/fs/repoA")
+	require.NoError(t, err)
+	b, err := fs.Sub(repos, "testdata/fs/repoB")
+	require.NoError(t, err)
+	c, err := fs.Sub(repos, "testdata/fs/repoC")
+	require.NoError(t, err)
+	d, err := fs.Sub(repos, "testdata/fs/repoD")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		args    args
+		want    map[string][]string
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "repoA",
+			args: args{
+				files:                    a,
+				autoplanModuleDependants: "**/init.tf",
+			},
+			want: map[string][]string{
+				"modules/bar": {"baz", "qux/quxx"},
+				"modules/foo": {"qux/quxx"},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "repoB",
+			args: args{
+				files:                    b,
+				autoplanModuleDependants: "**/init.tf",
+			},
+			want: map[string][]string{
+				"modules/bar": {"dev/quxx", "prod/quxx"},
+				"modules/foo": {"dev/quxx", "prod/quxx"},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "self import cycle",
+			args: args{
+				files:                    c,
+				autoplanModuleDependants: "**/init.tf",
+			},
+			want: map[string][]string{
+				"self": {"self"},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "mutual cycle",
+			args: args{
+				files:                    d,
+				autoplanModuleDependants: "**/init.tf",
+			},
+			want: map[string][]string{
+				"a": {"a", "b"},
+				"b": {"a", "b"},
+			},
+			wantErr: assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := findModuleDependants(tt.args.files, tt.args.autoplanModuleDependants)
+			if !tt.wantErr(t, err, fmt.Sprintf("findModuleDependants(%v, %v)", tt.args.files, tt.args.autoplanModuleDependants)) {
+				return
+			}
+			for k, v := range tt.want {
+				projects := got.DependentProjects(k)
+				sort.Strings(projects)
+				assert.Equalf(t, v, projects, "%v.DownstreamProjects(%v)", got, k)
+			}
+		})
+	}
+}

@@ -1,0 +1,204 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+//
+// Package logging handles logging throughout Atlantis.
+package logging
+
+import (
+	"bytes"
+	"fmt"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest"
+)
+
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_simple_logging.go SimpleLogging
+
+// SimpleLogging is the interface used for logging throughout the codebase.
+type SimpleLogging interface {
+
+	// These basically just fmt.Sprintf() the message and args.
+	Debug(format string, a ...any)
+	Info(format string, a ...any)
+	Warn(format string, a ...any)
+	Err(format string, a ...any)
+	Log(level LogLevel, format string, a ...any)
+	SetLevel(lvl LogLevel)
+
+	// With adds a variadic number of fields to the logging context. It accepts a
+	// mix of strongly-typed Field objects and loosely-typed key-value pairs. When
+	// processing pairs, the first element of the pair is used as the field key
+	// and the second as the field value.
+	With(a ...any) SimpleLogging
+
+	// Creates a new logger with history preserved . log storage + search strategies
+	// should ideally be used instead of managing this ourselves.
+	// keeping as a separate method to ensure that usage of history is completely intentional
+	WithHistory(a ...any) SimpleLogging
+
+	// Fetches the history we've stored associated with the logging context
+	GetHistory() string
+
+	// Flushes anything left in the buffer
+	Flush() error
+}
+
+type StructuredLogger struct {
+	z           *zap.SugaredLogger
+	level       zap.AtomicLevel
+	keepHistory bool
+	// History stores all log entries ever written using
+	// this logger. This is safe for short-lived loggers
+	// like those used during plan/apply commands.
+	// TODO: Deprecate this
+	// this is added here to maintain backwards compatibility
+	// This doesn't really make sense to keep given that structured logging
+	// gives us the ability to query our logs across multiple dimensions
+	// I don't believe we should mix this in with atlantis commands and expose this to the user
+	history bytes.Buffer
+}
+
+func NewStructuredLoggerFromLevel(lvl LogLevel) (SimpleLogging, error) {
+	cfg := zap.NewProductionConfig()
+
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	cfg.Level = zap.NewAtomicLevelAt(lvl.zLevel)
+	return newStructuredLogger(cfg)
+}
+
+func NewStructuredLogger() (SimpleLogging, error) {
+	cfg := zap.NewProductionConfig()
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	return newStructuredLogger(cfg)
+}
+
+func newStructuredLogger(cfg zap.Config) (*StructuredLogger, error) {
+	baseLogger, err := cfg.Build()
+
+	baseLogger = baseLogger.
+		// ensures that the caller doesn't just say logging/simple_logger each time
+		WithOptions(zap.AddCallerSkip(1)).
+		WithOptions(zap.AddStacktrace(zapcore.WarnLevel)).
+		// creates isolated context for all future kv pairs, name can be flexible as needed
+		With(zap.Namespace("json"))
+
+	if err != nil {
+		return nil, fmt.Errorf(" initializing structured logger: %w", err)
+	}
+
+	return &StructuredLogger{
+		z:     baseLogger.Sugar(),
+		level: cfg.Level,
+	}, nil
+}
+
+func (l *StructuredLogger) With(a ...any) SimpleLogging {
+	return &StructuredLogger{
+		z:     l.z.With(a...),
+		level: l.level,
+	}
+}
+
+func (l *StructuredLogger) WithHistory(a ...any) SimpleLogging {
+	logger := &StructuredLogger{
+		z:     l.z.With(a...),
+		level: l.level,
+	}
+
+	// ensure that the history is kept across loggers.
+	logger.keepHistory = true
+	logger.history = l.history
+
+	return logger
+}
+
+func (l *StructuredLogger) GetHistory() string {
+	return l.history.String()
+}
+
+func (l *StructuredLogger) Debug(format string, a ...any) {
+	l.z.Debugf(format, a...)
+	l.saveToHistory(Debug, format, a...)
+}
+
+func (l *StructuredLogger) Info(format string, a ...any) {
+	l.z.Infof(format, a...)
+	l.saveToHistory(Info, format, a...)
+}
+
+func (l *StructuredLogger) Warn(format string, a ...any) {
+	l.z.Warnf(format, a...)
+	l.saveToHistory(Warn, format, a...)
+}
+
+func (l *StructuredLogger) Err(format string, a ...any) {
+	l.z.Errorf(format, a...)
+	l.saveToHistory(Error, format, a...)
+}
+
+func (l *StructuredLogger) Log(level LogLevel, format string, a ...any) {
+	switch level {
+	case Debug:
+		l.z.Debugf(format, a...)
+	case Info:
+		l.z.Infof(format, a...)
+	case Warn:
+		l.z.Warnf(format, a...)
+	case Error:
+		l.z.Errorf(format, a...)
+	}
+}
+
+func (l *StructuredLogger) SetLevel(lvl LogLevel) {
+	if l != nil {
+		l.level.SetLevel(lvl.zLevel)
+	}
+}
+
+func (l *StructuredLogger) Flush() error {
+	return l.z.Sync()
+}
+
+func (l *StructuredLogger) saveToHistory(lvl LogLevel, format string, a ...any) {
+	if !l.keepHistory {
+		return
+	}
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintf(&l.history, "[%s] %s\n", lvl.shortStr, msg)
+}
+
+// NewNoopLogger creates a logger instance that discards all logs and never
+// writes them. Used for testing.
+func NewNoopLogger(t zaptest.TestingT) SimpleLogging {
+	level := zap.DebugLevel
+	return &StructuredLogger{
+		z:     zaptest.NewLogger(t, zaptest.Level(level)).Sugar(),
+		level: zap.NewAtomicLevelAt(level),
+	}
+}
+
+type LogLevel struct {
+	zLevel   zapcore.Level
+	shortStr string
+}
+
+var (
+	Debug = LogLevel{
+		zLevel:   zapcore.DebugLevel,
+		shortStr: "DBUG",
+	}
+	Info = LogLevel{
+		zLevel:   zapcore.InfoLevel,
+		shortStr: "INFO",
+	}
+	Warn = LogLevel{
+		zLevel:   zapcore.WarnLevel,
+		shortStr: "WARN",
+	}
+	Error = LogLevel{
+		zLevel:   zapcore.ErrorLevel,
+		shortStr: "EROR",
+	}
+)

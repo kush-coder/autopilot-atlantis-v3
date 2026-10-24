@@ -1,0 +1,95 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package valid
+
+import (
+	"slices"
+	"strings"
+
+	version "github.com/hashicorp/go-version"
+)
+
+const (
+	LocalPolicySet  string = "local"
+	GithubPolicySet string = "github"
+)
+
+// DefaultPolicyItemRegex matches the entire non-empty policy output as a
+// single item ((?s) makes . match newlines). Any change invalidates the
+// approval. Override with `.+` for per-line matching.
+const DefaultPolicyItemRegex = `(?s).+`
+
+// PolicySets defines version of policy checker binary(conftest) and a list of
+// PolicySet objects. PolicySets struct is used by PolicyCheck workflow to build
+// context to enforce policies.
+type PolicySets struct {
+	Version         *version.Version
+	Owners          PolicyOwners
+	ApproveCount    int
+	StickyApprovals bool
+	PolicyItemRegex string
+	PolicySets      []PolicySet
+}
+
+type PolicyOwners struct {
+	Users []string
+	Teams []string
+}
+
+type PolicySet struct {
+	Source             string
+	Path               string
+	Name               string
+	ApproveCount       int
+	StickyApprovals    bool
+	PolicyItemRegex    string
+	Owners             PolicyOwners
+	PreventSelfApprove bool
+}
+
+func (p *PolicySets) HasPolicies() bool {
+	return len(p.PolicySets) > 0
+}
+
+// Check if any level of policy owners includes teams
+func (p *PolicySets) HasTeamOwners() bool {
+	hasTeamOwners := len(p.Owners.Teams) > 0
+	for _, policySet := range p.PolicySets {
+		if len(policySet.Owners.Teams) > 0 {
+			hasTeamOwners = true
+		}
+	}
+	return hasTeamOwners
+}
+
+func (o *PolicyOwners) IsOwner(username string, userTeams []string) bool {
+	for _, uname := range o.Users {
+		if strings.EqualFold(uname, username) {
+			return true
+		}
+	}
+
+	for _, orgTeamName := range o.Teams {
+		for _, userTeamName := range userTeams {
+			if strings.EqualFold(orgTeamName, userTeamName) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// Return all owner teams from all policy sets
+func (p *PolicySets) AllTeams() []string {
+	teams := p.Owners.Teams
+	for _, policySet := range p.PolicySets {
+		for _, team := range policySet.Owners.Teams {
+			if !slices.Contains(teams, team) {
+				teams = append(teams, team)
+			}
+		}
+	}
+	return teams
+}

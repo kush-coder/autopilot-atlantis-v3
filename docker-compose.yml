@@ -1,0 +1,39 @@
+# Note: This file is only used for Atlantis local development
+services:
+  ngrok:
+    image: ngrok/ngrok:latest@sha256:14d80d083e5b53145f416bbbd36238336c9de4016c43fd950eb2eb845670583b
+    ports:
+      - 4040:4040
+    command:
+      - "http"
+      - "atlantis:4141"
+    env_file:
+      - atlantis.env
+    depends_on:
+      - atlantis
+  redis:
+    image: redis:8.6-alpine@sha256:ac2da09bc822f325a9f68f533120b86fa39c1b8db46b3aa7c1bbea7fdfd4fcba
+    restart: always
+    ports:
+      - 6379:6379
+    command: redis-server --save 20 1 --loglevel warning --requirepass test123
+    volumes:
+      - redis:/data
+  atlantis:
+    depends_on:
+      - redis
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - 4141:4141
+    volumes:
+      - ${HOME}/.ssh:/.ssh:ro
+      - ${PWD}:/atlantis/src:ro
+    # Contains the flags that atlantis uses in env var form
+    env_file:
+      - atlantis.env
+
+volumes:
+  redis:
+    driver: local

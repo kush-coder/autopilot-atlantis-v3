@@ -1,0 +1,685 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+
+package events
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"text/template"
+
+	"github.com/bmatcuk/doublestar/v4"
+	"github.com/google/shlex"
+	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/utils"
+	"github.com/spf13/pflag"
+)
+
+const (
+	workspaceFlagLong            = "workspace"
+	workspaceFlagShort           = "w"
+	dirFlagLong                  = "dir"
+	dirFlagShort                 = "d"
+	projectFlagLong              = "project"
+	projectFlagShort             = "p"
+	policySetFlagLong            = "policy-set"
+	policySetFlagShort           = ""
+	autoMergeDisabledFlagLong    = "auto-merge-disabled"
+	autoMergeDisabledFlagShort   = ""
+	autoMergeMethodFlagLong      = "auto-merge-method"
+	autoMergeMethodFlagShort     = ""
+	verboseFlagLong              = "verbose"
+	verboseFlagShort             = ""
+	clearPolicyApprovalFlagLong  = "clear-policy-approval"
+	clearPolicyApprovalFlagShort = ""
+)
+
+// DefaultBlockedExtraArgs is the default set of Terraform CLI flag prefixes
+// that are rejected when supplied as comment extra args (after "--"). These
+// flags could be used to bypass security controls (e.g. working-directory
+// traversal via -chdir, or loading of malicious providers via -plugin-dir).
+// Operators may override this list via the --blocked-extra-args server flag.
+var DefaultBlockedExtraArgs = []string{
+	"-chdir",
+	"--chdir",
+	"-plugin-dir",
+	"--plugin-dir",
+}
+
+// multiLineRegex is used to ignore multi-line comments since those aren't valid
+// Atlantis commands. If the second line just has newlines then we let it pass
+// through because when you double click on a comment in GitHub and then you
+// paste it again, GitHub adds two newlines and so we wanted to allow copying
+// and pasting GitHub comments.
+var multiLineRegex = regexp.MustCompile(`.*\r?\n[^\r\n]+`)
+
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_comment_parsing.go CommentParsing
+
+// CommentParsing handles parsing pull request comments.
+type CommentParsing interface {
+	// Parse attempts to parse a pull request comment to see if it's an Atlantis
+	// command.
+	Parse(comment string, vcsHost models.VCSHostType) CommentParseResult
+}
+
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_comment_building.go CommentBuilder
+
+// CommentBuilder builds comment commands that can be used on pull requests.
+type CommentBuilder interface {
+	// BuildPlanComment builds a plan comment for the specified args.
+	BuildPlanComment(repoRelDir string, workspace string, project string, commentArgs []string) string
+	// BuildApplyComment builds an apply comment for the specified args.
+	BuildApplyComment(repoRelDir string, workspace string, project string, autoMergeDisabled bool, autoMergeMethod string) string
+	// BuildApprovePoliciesComment builds an approve_policies comment for the specified args.
+	BuildApprovePoliciesComment(repoRelDir string, workspace string, project string) string
+}
+
+// CommentParser implements CommentParsing
+type CommentParser struct {
+	GithubUser      string
+	GitlabUser      string
+	GiteaUser       string
+	BitbucketUser   string
+	AzureDevopsUser string
+	ExecutableName  string
+	AllowCommands   []command.Name
+	// BlockedExtraArgs is the set of Terraform CLI flag prefixes that are
+	// rejected when supplied as comment extra args (after "--").
+	// Populated by NewCommentParser from UserConfig.ToBlockedExtraArgs().
+	BlockedExtraArgs []string
+}
+
+// NewCommentParser returns a CommentParser.
+func NewCommentParser(githubUser, gitlabUser, giteaUser, bitbucketUser, azureDevopsUser, executableName string, allowCommands []command.Name, blockedExtraArgs []string) *CommentParser {
+	var commentAllowCommands []command.Name
+	for _, acceptableCommand := range command.AllCommentCommands {
+		for _, allowCommand := range allowCommands {
+			if acceptableCommand == allowCommand {
+				commentAllowCommands = append(commentAllowCommands, allowCommand)
+				break // for distinct
+			}
+		}
+	}
+
+	return &CommentParser{
+		GithubUser:       githubUser,
+		GitlabUser:       gitlabUser,
+		GiteaUser:        giteaUser,
+		BitbucketUser:    bitbucketUser,
+		AzureDevopsUser:  azureDevopsUser,
+		ExecutableName:   executableName,
+		AllowCommands:    commentAllowCommands,
+		BlockedExtraArgs: blockedExtraArgs,
+	}
+}
+
+// CommentParseResult describes the result of parsing a comment as a command.
+type CommentParseResult struct {
+	// Command is the successfully parsed command. Will be nil if
+	// CommentResponse or Ignore is set.
+	Command *CommentCommand
+	// CommentResponse is set when we should respond immediately to the command
+	// for example for atlantis help.
+	CommentResponse string
+	// Ignore is set to true when we should just ignore this comment.
+	Ignore bool
+}
+
+// Parse parses the comment as an Atlantis command.
+//
+// Valid commands contain:
+//   - The initial "executable" name, 'run' or 'atlantis' or '@GithubUser'
+//     where GithubUser is the API user Atlantis is running as.
+//   - Then a command: 'plan', 'apply', 'unlock', 'version, 'approve_policies',
+//     or 'help'.
+//   - Then optional flags, then an optional separator '--' followed by optional
+//     extra flags to be appended to the terraform plan/apply command.
+//
+// Examples:
+// - atlantis help
+// - run apply
+// - @GithubUser plan -w staging
+// - atlantis plan -w staging -d dir --verbose
+// - atlantis plan --verbose -- -key=value -key2 value2
+// - atlantis unlock
+// - atlantis version
+// - atlantis approve_policies
+// - atlantis import ADDRESS ID
+func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) CommentParseResult {
+	comment := strings.TrimSpace(rawComment)
+	comment = strings.Trim(comment, "`")
+
+	if multiLineRegex.MatchString(comment) {
+		return CommentParseResult{Ignore: true}
+	}
+
+	// We first use strings.Fields to parse and do an initial evaluation.
+	// Later we use a proper shell parser and re-parse.
+	args := strings.Fields(comment)
+	if len(args) < 1 {
+		return CommentParseResult{Ignore: true}
+	}
+
+	// Lowercase it to avoid autocorrect issues with browsers.
+	executableName := strings.ToLower(args[0])
+
+	// Helpfully warn the user if they're using "terraform" instead of "atlantis"
+	if executableName == "terraform" && e.ExecutableName != "terraform" {
+		return CommentParseResult{CommentResponse: fmt.Sprintf(DidYouMeanAtlantisComment, e.ExecutableName, "terraform")}
+	}
+
+	// Helpfully warn the user that the command might be misspelled. Only do this
+	// when running under the default executable name — operators who've
+	// customized ExecutableName (e.g. running multiple Atlantis servers against
+	// one repo) can otherwise get spurious "did you mean" replies to ordinary
+	// comments that happen to be Levenshtein-close to their custom name.
+	if e.ExecutableName == defaultExecutableName && utils.IsSimilarWord(executableName, e.ExecutableName) {
+		return CommentParseResult{CommentResponse: fmt.Sprintf(DidYouMeanAtlantisComment, e.ExecutableName, args[0])}
+	}
+
+	// Atlantis can be invoked using the name of the VCS host user we're
+	// running under. Need to be able to match against that user.
+	var vcsUser string
+	switch vcsHost {
+	case models.Github:
+		vcsUser = e.GithubUser
+	case models.Gitlab:
+		vcsUser = e.GitlabUser
+	case models.Gitea:
+		vcsUser = e.GiteaUser
+	case models.BitbucketCloud, models.BitbucketServer:
+		vcsUser = e.BitbucketUser
+	case models.AzureDevops:
+		vcsUser = e.AzureDevopsUser
+	}
+	executableNames := []string{"run", e.ExecutableName, "@" + vcsUser}
+	if !slices.Contains(executableNames, executableName) {
+		return CommentParseResult{Ignore: true}
+	}
+
+	// Now that we know Atlantis is being invoked, re-parse using a shell-style
+	// parser.
+	args, err := shlex.Split(comment)
+	if err != nil {
+		return CommentParseResult{CommentResponse: fmt.Sprintf("```\nError parsing command: %s\n```", err)}
+	}
+	if len(args) < 1 {
+		return CommentParseResult{Ignore: true}
+	}
+
+	// If they've just typed the name of the executable then give them the help
+	// output.
+	if len(args) == 1 {
+		return CommentParseResult{CommentResponse: e.HelpComment()}
+	}
+
+	// Lowercase it to avoid autocorrect issues with browsers.
+	cmd := strings.ToLower(args[1])
+
+	// Help output.
+	if slices.Contains([]string{"help", "-h", "--help"}, cmd) {
+		return CommentParseResult{CommentResponse: e.HelpComment()}
+	}
+
+	// Need to have allow commands at this point.
+	if !e.isAllowedCommand(cmd) {
+		var allowCommandList []string
+		for _, allowCommand := range e.AllowCommands {
+			allowCommandList = append(allowCommandList, allowCommand.String())
+		}
+		return CommentParseResult{CommentResponse: fmt.Sprintf("```\nError: unknown command %q.\nRun '%s --help' for usage.\nAvailable commands(--allow-commands): %s\n```", cmd, e.ExecutableName, strings.Join(allowCommandList, ", "))}
+	}
+
+	var workspace string
+	var dir string
+	var project string
+	var policySet string
+	var clearPolicyApproval bool
+	var verbose bool
+	var autoMergeDisabled bool
+	var autoMergeMethod string
+	var flagSet *pflag.FlagSet
+	var name command.Name
+
+	// Set up the flag parsing depending on the command.
+	switch cmd {
+	case command.Plan.String():
+		name = command.Plan
+		flagSet = pflag.NewFlagSet(command.Plan.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Switch to this Terraform workspace before planning.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Which directory to run plan in relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Which project to run plan for. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	case command.Apply.String():
+		name = command.Apply
+		flagSet = pflag.NewFlagSet(command.Apply.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Apply the plan for this Terraform workspace.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Apply the plan for this directory, relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Apply the plan for this project. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.BoolVarP(&autoMergeDisabled, autoMergeDisabledFlagLong, autoMergeDisabledFlagShort, false, "Disable automerge after apply.")
+		flagSet.StringVarP(&autoMergeMethod, autoMergeMethodFlagLong, autoMergeMethodFlagShort, "", "Specifies the merge method for the VCS if automerge is enabled. (Currently only implemented for GitHub)")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	case command.ApprovePolicies.String():
+		name = command.ApprovePolicies
+		flagSet = pflag.NewFlagSet(command.ApprovePolicies.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Approve policies for this Terraform workspace.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Approve policies for this directory, relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Approve policies for this project. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.StringVarP(&policySet, policySetFlagLong, policySetFlagShort, "", "Approve policies for this project. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.BoolVarP(&clearPolicyApproval, clearPolicyApprovalFlagLong, clearPolicyApprovalFlagShort, false, "Clear any existing policy approvals.")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	case command.Unlock.String():
+		name = command.Unlock
+		flagSet = pflag.NewFlagSet(command.Unlock.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+	case command.Cancel.String():
+		name = command.Cancel
+		flagSet = pflag.NewFlagSet(command.Cancel.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+	case command.Version.String():
+		name = command.Version
+		flagSet = pflag.NewFlagSet(command.Version.String(), pflag.ContinueOnError)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Switch to this Terraform workspace before running version.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Which directory to run version in relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Print the version for this project. Refers to the name of the project configured in a repo config file.")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	case command.Import.String():
+		name = command.Import
+		flagSet = pflag.NewFlagSet(command.Import.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Switch to this Terraform workspace before importing.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Which directory to run import in relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Which project to run import for. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	case command.State.String():
+		name = command.State
+		flagSet = pflag.NewFlagSet(command.State.String(), pflag.ContinueOnError)
+		flagSet.SetOutput(io.Discard)
+		flagSet.StringVarP(&workspace, workspaceFlagLong, workspaceFlagShort, "", "Switch to this Terraform workspace before processing tfstate.")
+		flagSet.StringVarP(&dir, dirFlagLong, dirFlagShort, "", "Which directory to run state command in relative to root of repo, ex. 'child/dir'.")
+		flagSet.StringVarP(&project, projectFlagLong, projectFlagShort, "", "Which project to run state command for. Refers to the name of the project configured in a repo config file. Cannot be used at same time as workspace or dir flags.")
+		flagSet.BoolVarP(&verbose, verboseFlagLong, verboseFlagShort, false, "Append Atlantis log to comment.")
+	default:
+		return CommentParseResult{CommentResponse: fmt.Sprintf("Error: unknown command %q – this is a bug", cmd)}
+	}
+
+	subName, extraArgs, errResult := e.parseArgs(name, args, flagSet)
+	if errResult != "" {
+		return CommentParseResult{CommentResponse: errResult}
+	}
+
+	dir, err = e.validateDir(dir)
+	if err != nil {
+		return CommentParseResult{CommentResponse: e.errMarkdown(err.Error(), cmd, flagSet)}
+	}
+
+	// The workspace ends up both in the string Atlantis runs via "sh -c" when
+	// invoking Terraform and in the paths of files we create, so it is
+	// restricted to the same character set as a repo-config workspace. The
+	// previous check here used url.PathEscape, which leaves shell
+	// metacharacters such as '&' untouched.
+	if err := valid.ValidateWorkspaceName(workspace); err != nil {
+		return CommentParseResult{CommentResponse: e.errMarkdown(fmt.Sprintf("invalid workspace %q: %s", workspace, err), cmd, flagSet)}
+	}
+
+	// If project is specified, dir or workspace should not be set. Since we
+	// dir/workspace have defaults we can't detect if the user set the flag
+	// to the default or didn't set the flag so there is an edge case here we
+	// don't detect, ex. atlantis plan -p project -d . -w default won't cause
+	// an error.
+	if project != "" && (workspace != "" || dir != "") {
+		err := fmt.Sprintf("cannot use -%s/--%s at same time as -%s/--%s or -%s/--%s", projectFlagShort, projectFlagLong, dirFlagShort, dirFlagLong, workspaceFlagShort, workspaceFlagLong)
+		return CommentParseResult{CommentResponse: e.errMarkdown(err, cmd, flagSet)}
+	}
+
+	if autoMergeMethod != "" {
+		if autoMergeDisabled {
+			err := fmt.Sprintf("cannot use --%s at the same time as --%s", autoMergeMethodFlagLong, autoMergeDisabledFlagLong)
+			return CommentParseResult{CommentResponse: e.errMarkdown(err, cmd, flagSet)}
+		}
+
+		if vcsHost != models.Github {
+			err := fmt.Sprintf("--%s is not currently implemented for %s", autoMergeMethodFlagLong, vcsHost.String())
+			return CommentParseResult{CommentResponse: e.errMarkdown(err, cmd, flagSet)}
+		}
+	}
+
+	return CommentParseResult{
+		Command: NewCommentCommand(dir, extraArgs, name, subName, verbose, autoMergeDisabled, autoMergeMethod, workspace, project, policySet, clearPolicyApproval),
+	}
+}
+
+func (e *CommentParser) parseArgs(name command.Name, args []string, flagSet *pflag.FlagSet) (string, []string, string) {
+	// Now parse the flags.
+	// It's safe to use [2:] because we know there's at least 2 elements in args.
+	err := flagSet.Parse(args[2:])
+	if err == pflag.ErrHelp {
+		return "", nil, fmt.Sprintf("```\nUsage of %s:\n%s\n```", name.DefaultUsage(), flagSet.FlagUsagesWrapped(usagesCols))
+	}
+	if err != nil {
+		if name == command.Unlock {
+			return "", nil, fmt.Sprintf(UnlockUsage, e.ExecutableName)
+		}
+		return "", nil, e.errMarkdown(err.Error(), name.String(), flagSet)
+	}
+
+	var commandArgs []string // commandArgs are the arguments that are passed before `--` without any parameter flags.
+	if flagSet.ArgsLenAtDash() == -1 {
+		commandArgs = flagSet.Args()
+	} else {
+		commandArgs = flagSet.Args()[0:flagSet.ArgsLenAtDash()]
+	}
+
+	// If command require subcommand, get it from command args
+	var subCommand string
+	availableSubCommands := name.SubCommands()
+	if len(availableSubCommands) > 0 { // command requires a subcommand
+		if len(commandArgs) < 1 {
+			return "", nil, e.errMarkdown("subcommand required", name.String(), flagSet)
+		}
+		subCommand, commandArgs = commandArgs[0], commandArgs[1:]
+		isAvailableSubCommand := slices.Contains(availableSubCommands, subCommand)
+		if !isAvailableSubCommand {
+			errMsg := fmt.Sprintf("invalid subcommand %s (not %s)", subCommand, strings.Join(availableSubCommands, ", "))
+			return "", nil, e.errMarkdown(errMsg, name.String(), flagSet)
+		}
+	}
+
+	// check command args count requirements
+	commandArgCount, err := name.CommandArgCount(subCommand)
+	if err != nil {
+		return "", nil, e.errMarkdown(err.Error(), name.String(), flagSet)
+	}
+	if !commandArgCount.IsMatchCount(len(commandArgs)) {
+		return "", nil, e.errMarkdown(fmt.Sprintf("unknown argument(s) – %s", strings.Join(commandArgs, " ")), name.DefaultUsage(), flagSet)
+	}
+
+	var extraArgs []string // command extra_args
+	if flagSet.ArgsLenAtDash() != -1 {
+		extraArgs = append(extraArgs, flagSet.Args()[flagSet.ArgsLenAtDash():]...)
+	}
+
+	// pass commandArgs into extraArgs after extra args.
+	// - after comment_parser, we will use extra_args only.
+	// - terraform command args accept after options like followings
+	//   - e.g.
+	//     - from: `atlantis import ADDRESS ID -- -var foo=bar
+	//     - to: `terraform import -var foo=bar ADDRESS ID`
+	//   - e.g.
+	//     - from: `atlantis state rm ADDRESS1 ADDRESS2 -- -var foo=bar
+	//     - to: `terraform state rm -var foo=bar ADDRESS1 ADDRESS2` (subcommand=rm)
+	extraArgs = append(extraArgs, commandArgs...)
+
+	// Reject extra args that contain blocked Terraform CLI flags.
+	// These flags could be used to bypass security controls (e.g. directory
+	// traversal via -chdir, or loading malicious providers via -plugin-dir).
+	for _, arg := range extraArgs {
+		if e.isBlockedExtraArg(arg) {
+			return "", nil, e.errMarkdown(fmt.Sprintf("flag %q is not allowed in extra args", arg), name.String(), flagSet)
+		}
+	}
+	return subCommand, extraArgs, ""
+}
+
+// isBlockedExtraArg returns true if arg is a Terraform CLI flag that is not
+// permitted in comment extra args for security reasons.
+func (e *CommentParser) isBlockedExtraArg(arg string) bool {
+	for _, blocked := range e.BlockedExtraArgs {
+		if arg == blocked || strings.HasPrefix(arg, blocked+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildPlanComment builds a plan comment for the specified args.
+func (e *CommentParser) BuildPlanComment(repoRelDir string, workspace string, project string, commentArgs []string) string {
+	flags := e.buildFlags(repoRelDir, workspace, project, false, "")
+	commentFlags := ""
+	if len(commentArgs) > 0 {
+		var flagsWithoutQuotes []string
+		for _, f := range commentArgs {
+			f = strings.TrimPrefix(f, "\"")
+			f = strings.TrimSuffix(f, "\"")
+			flagsWithoutQuotes = append(flagsWithoutQuotes, f)
+		}
+		commentFlags = fmt.Sprintf(" -- %s", strings.Join(flagsWithoutQuotes, " "))
+	}
+	return fmt.Sprintf("%s %s%s%s", e.ExecutableName, command.Plan.String(), flags, commentFlags)
+}
+
+// BuildApplyComment builds an apply comment for the specified args.
+func (e *CommentParser) BuildApplyComment(repoRelDir string, workspace string, project string, autoMergeDisabled bool, autoMergeMethod string) string {
+	flags := e.buildFlags(repoRelDir, workspace, project, autoMergeDisabled, autoMergeMethod)
+	return fmt.Sprintf("%s %s%s", e.ExecutableName, command.Apply.String(), flags)
+}
+
+// BuildApprovePoliciesComment builds an apply comment for the specified args.
+func (e *CommentParser) BuildApprovePoliciesComment(repoRelDir string, workspace string, project string) string {
+	flags := e.buildFlags(repoRelDir, workspace, project, false, "")
+	return fmt.Sprintf("%s %s%s", e.ExecutableName, command.ApprovePolicies.String(), flags)
+}
+
+func (e *CommentParser) buildFlags(repoRelDir string, workspace string, project string, autoMergeDisabled bool, autoMergeMethod string) string {
+	// Add quotes if dir has spaces.
+	if strings.Contains(repoRelDir, " ") {
+		repoRelDir = fmt.Sprintf("%q", repoRelDir)
+	}
+
+	var flags string
+	switch {
+	// If project is specified we can just use its name.
+	case project != "":
+		flags = fmt.Sprintf(" -%s %s", projectFlagShort, project)
+	case repoRelDir == DefaultRepoRelDir && workspace == DefaultWorkspace:
+		// If it's the root and default workspace then we just need to specify one
+		// of the flags and the other will get defaulted.
+		flags = fmt.Sprintf(" -%s %s", dirFlagShort, DefaultRepoRelDir)
+	case repoRelDir == DefaultRepoRelDir:
+		// If dir is the default then we just need to specify workspace.
+		flags = fmt.Sprintf(" -%s %s", workspaceFlagShort, workspace)
+	case workspace == DefaultWorkspace:
+		// If workspace is the default then we just need to specify the dir.
+		flags = fmt.Sprintf(" -%s %s", dirFlagShort, repoRelDir)
+	default:
+		// Otherwise we have to specify both flags.
+		flags = fmt.Sprintf(" -%s %s -%s %s", dirFlagShort, repoRelDir, workspaceFlagShort, workspace)
+	}
+	if autoMergeDisabled {
+		flags = fmt.Sprintf("%s --%s", flags, autoMergeDisabledFlagLong)
+	}
+	if autoMergeMethod != "" {
+		flags = fmt.Sprintf("%s --%s %s", flags, autoMergeMethodFlagLong, autoMergeMethod)
+	}
+	return flags
+}
+
+func (e *CommentParser) validateDir(dir string) (string, error) {
+	if dir == "" {
+		return dir, nil
+	}
+
+	// Check if dir contains glob pattern characters
+	if containsGlobPattern(dir) {
+		// For glob patterns, we validate but don't clean (cleaning mangles glob chars)
+		// Security check: prevent directory traversal even in glob patterns
+		if strings.Contains(dir, "..") {
+			return "", fmt.Errorf("using '..' in glob pattern %q with -%s/--%s is not allowed", dir, dirFlagShort, dirFlagLong)
+		}
+
+		// Validate the glob pattern syntax
+		if !doublestar.ValidatePattern(dir) {
+			return "", fmt.Errorf("invalid glob pattern %q with -%s/--%s", dir, dirFlagShort, dirFlagLong)
+		}
+
+		// Clean leading ./ or / for consistency with non-glob paths
+		dir = strings.TrimPrefix(dir, "./")
+		dir = strings.TrimPrefix(dir, "/")
+		if dir == "" {
+			dir = "."
+		}
+
+		return dir, nil
+	}
+
+	// For non-glob patterns, use standard path cleaning
+	validatedDir := filepath.Clean(dir)
+	// Join with . so the path is relative. This helps us if they use '/',
+	// and is safe to do if their path is relative since it's a no-op.
+	validatedDir = filepath.Join(".", validatedDir)
+	// Need to clean again to resolve relative validatedDirs.
+	validatedDir = filepath.Clean(validatedDir)
+	// Detect relative dirs since they're not allowed.
+	if strings.HasPrefix(validatedDir, "..") {
+		return "", fmt.Errorf("using a relative path %q with -%s/--%s is not allowed", dir, dirFlagShort, dirFlagLong)
+	}
+
+	return validatedDir, nil
+}
+
+// containsGlobPattern returns true if the string contains glob pattern characters.
+func containsGlobPattern(s string) bool {
+	return strings.ContainsAny(s, "*?[")
+}
+
+func (e *CommentParser) isAllowedCommand(cmd string) bool {
+	for _, allowed := range e.AllowCommands {
+		if allowed.String() == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *CommentParser) errMarkdown(errMsg string, cmd string, flagSet *pflag.FlagSet) string {
+	return fmt.Sprintf("```\nError: %s.\nUsage of %s:\n%s```", errMsg, cmd, flagSet.FlagUsagesWrapped(usagesCols))
+}
+
+func (e *CommentParser) HelpComment() string {
+	buf := &bytes.Buffer{}
+	var tmpl = template.Must(template.New("").Parse(helpCommentTemplate))
+	if err := tmpl.Execute(buf, struct {
+		ExecutableName       string
+		AllowVersion         bool
+		AllowPlan            bool
+		AllowApply           bool
+		AllowCancel          bool
+		AllowUnlock          bool
+		AllowApprovePolicies bool
+		AllowImport          bool
+		AllowState           bool
+	}{
+		ExecutableName:       e.ExecutableName,
+		AllowVersion:         e.isAllowedCommand(command.Version.String()),
+		AllowPlan:            e.isAllowedCommand(command.Plan.String()),
+		AllowApply:           e.isAllowedCommand(command.Apply.String()),
+		AllowCancel:          e.isAllowedCommand(command.Cancel.String()),
+		AllowUnlock:          e.isAllowedCommand(command.Unlock.String()),
+		AllowApprovePolicies: e.isAllowedCommand(command.ApprovePolicies.String()),
+		AllowImport:          e.isAllowedCommand(command.Import.String()),
+		AllowState:           e.isAllowedCommand(command.State.String()),
+	}); err != nil {
+		return fmt.Sprintf("Failed to render template, this is a bug: %v", err)
+	}
+	return buf.String()
+}
+
+var helpCommentTemplate = "```cmake\n" +
+	`atlantis
+Terraform Pull Request Automation
+
+Usage:
+  {{ .ExecutableName }} <command> [options] -- [terraform options]
+
+Examples:
+  # show atlantis help
+  {{ .ExecutableName }} help
+{{- if .AllowPlan }}
+
+  # run plan in the root directory passing the -target flag to terraform
+  {{ .ExecutableName }} plan -d . -- -target=resource
+{{- end }}
+{{- if .AllowApply }}
+
+  # apply all unapplied plans from this pull request
+  {{ .ExecutableName }} apply
+
+  # apply the plan for the root directory and staging workspace
+  {{ .ExecutableName }} apply -d . -w staging
+{{- end }}
+
+Commands:
+{{- if .AllowPlan }}
+  plan     Runs 'terraform plan' for the changes in this pull request.
+           To plan a specific project, use the -d, -w and -p flags.
+{{- end }}
+{{- if .AllowApply }}
+  apply    Runs 'terraform apply' on all unapplied plans from this pull request.
+           To only apply a specific plan, use the -d, -w and -p flags.
+{{- end }}
+{{- if .AllowCancel }}
+  cancel   Cancels all queued commands for this pull request.
+           Already running commands are not interrupted.
+{{- end }}
+{{- if .AllowUnlock }}
+  unlock   Removes all atlantis locks and discards all plans for this PR.
+           To unlock a specific plan you can use the Atlantis UI.
+{{- end }}
+{{- if .AllowApprovePolicies }}
+  approve_policies
+           Approves all current policy checking failures for the PR.
+{{- end }}
+{{- if .AllowVersion }}
+  version  Print the output of 'terraform version'
+{{- end }}
+{{- if .AllowImport }}
+  import ADDRESS ID
+           Runs 'terraform import' for the passed address resource.
+           To import a specific project, use the -d, -w and -p flags.
+{{- end }}
+{{- if .AllowState }}
+  state rm ADDRESS...
+           Runs 'terraform state rm' for the passed address resource.
+           To remove a specific project resource, use the -d, -w and -p flags.
+{{- end }}
+  help     View help.
+
+Flags:
+  -h, --help   help for atlantis
+
+Use "{{ .ExecutableName }} [command] --help" for more information about a command.` +
+	"\n```"
+
+// DidYouMeanAtlantisComment is the comment we add to the pull request when
+// someone runs a misspelled command or terraform instead of atlantis.
+var DidYouMeanAtlantisComment = "Did you mean to use `%s` instead of `%s`?"
+
+// DefaultExecutableName is the value of ExecutableName Atlantis uses unless
+// an operator overrides it via --executable-name / ATLANTIS_EXECUTABLE_NAME.
+// This is intentionally a separate literal from cmd.DefaultExecutableName:
+// server/events cannot import cmd (cmd imports server, so the reverse would
+// be an import cycle). If the default executable name ever changes, update
+// both constants.
+const defaultExecutableName = "atlantis"
+
+// UnlockUsage is the comment we add to the pull request when someone runs
+// `atlantis unlock` with flags.
+
+var UnlockUsage = "`Usage of unlock:`\n\n ```cmake\n" +
+	`%s unlock
+
+  Unlocks the entire PR and discards all plans in this PR.
+  Arguments or flags are not supported at the moment.
+  If you need to unlock a specific project please use the atlantis UI.` +
+	"\n```"

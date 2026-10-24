@@ -1,0 +1,43 @@
+.idea
+./atlantis
+*.iml
+atlantis.db
+output
+.DS_Store
+.cover
+.terraform/
+node_modules/
+helm/test-values.yaml
+*.swp
+golangci-lint
+atlantis
+.devcontainer
+atlantis.env
+*.act
+Dockerfile.local
+
+# gitreleaser
+dist/
+tmp-CHANGELOG.md
+
+.envrc
+
+# IDE files
+*.code-workspace
+
+# draw.io backup files
+*.bkp
+
+# VitePress build output & cache directory
+**/.vitepress/cache
+**/.vitepress/dist
+**/.vitepress/config.ts.timestamp-*
+
+# playwright
+test-results/
+
+#Cursor dirs
+.cursor
+
+# lingo.dev staging dir for docs translation
+.lingo-src/

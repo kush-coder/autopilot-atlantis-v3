@@ -1,0 +1,92 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+
+package testdrive
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/google/go-github/v88/github"
+)
+
+var githubUsername string
+var githubToken string
+
+// Client used for GitHub interactions.
+type Client struct {
+	client *github.Client
+	ctx    context.Context
+}
+
+// CreateFork forks a GitHub repo into the user's account that is authenticated.
+func (g *Client) CreateFork(owner string, repoName string) error {
+	_, _, err := g.client.Repositories.CreateFork(g.ctx, owner, repoName, nil)
+	// The GitHub client returns an error even though the fork was successful.
+	// In order to figure out the exact error we will need to check the message.
+	if err != nil && !strings.Contains(err.Error(), "job scheduled on GitHub side; try again later") {
+		return err
+	}
+	return nil
+}
+
+// CheckForkSuccess waits for github fork to complete.
+// Forks can take up to 5 minutes to complete according to GitHub.
+func (g *Client) CheckForkSuccess(ownerName string, forkRepoName string) bool {
+	for range 5 {
+		if err := g.CreateFork(ownerName, forkRepoName); err == nil {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
+}
+
+// CreateWebhook creates a GitHub webhook to send requests to our local ngrok.
+func (g *Client) CreateWebhook(ownerName string, repoName string, hookURL string) error {
+	contentType := "json"
+	hookConfig := &github.HookConfig{
+		ContentType: github.Ptr(contentType),
+		URL:         github.Ptr(hookURL),
+	}
+	atlantisHook := &github.Hook{
+		Events: []string{"issue_comment", "pull_request", "pull_request_review", "push"},
+		Config: hookConfig,
+		Active: github.Ptr(true),
+	}
+	_, _, err := g.client.Repositories.CreateHook(g.ctx, ownerName, repoName, atlantisHook)
+	return err
+}
+
+// CreatePullRequest creates a GitHub pull request with custom title and
+// description. If there's already a pull request open for this branch it will
+// return successfully.
+func (g *Client) CreatePullRequest(ownerName string, repoName string, head string, base string) (string, error) {
+
+	// First check if the pull request already exists.
+	pulls, _, err := g.client.PullRequests.List(g.ctx, ownerName, repoName, nil)
+	if err != nil {
+		return "", err
+	}
+	for _, pull := range pulls {
+		if pull.Head.GetRef() == head && pull.Base.GetRef() == base {
+			return pull.GetHTMLURL(), nil
+		}
+	}
+
+	// If not, create it.
+	newPullRequest := &github.NewPullRequest{
+		Title: github.Ptr("Welcome to Atlantis!"),
+		Head:  github.Ptr(head),
+		Body:  github.Ptr(pullRequestBody),
+		Base:  github.Ptr(base),
+	}
+	pull, _, err := g.client.PullRequests.Create(g.ctx, ownerName, repoName, newPullRequest)
+	if err != nil {
+		return "", err
+	}
+
+	return pull.GetHTMLURL(), nil
+}

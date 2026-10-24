@@ -1,0 +1,30 @@
+Ran Plan for project: `dir1-ops` dir: `dir1` workspace: `ops`
+
+```diff
+random_id.dummy1[0]: Refreshing state... [id=AA]
+
+No changes. Your infrastructure matches the configuration.
+
+Terraform has compared your real infrastructure against your configuration
+and found no differences, so no changes are needed.
+```
+
+* :arrow_forward: To **apply** this plan, comment:
+  ```shell
+  atlantis apply -p dir1-ops
+  ```
+* :put_litter_in_its_place: To **delete** this plan and lock, click [here](lock-url)
+* :repeat: To **plan** this project again, comment:
+  ```shell
+  atlantis plan -p dir1-ops
+  ```
+
+---
+* :fast_forward: To **apply** all unapplied plans from this Pull Request, comment:
+  ```shell
+  atlantis apply
+  ```
+* :put_litter_in_its_place: To **delete** all plans and locks from this Pull Request, comment:
+  ```shell
+  atlantis unlock
+  ```

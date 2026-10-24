@@ -1,0 +1,49 @@
+version: "2"
+linters:
+  enable:
+    - modernize
+    - gochecknoinits
+    - gosec
+    - misspell
+    - revive
+    - testifylint
+    - unconvert
+  settings:
+    misspell:
+      ignore-rules:
+        - noteable
+    modernize:
+      disable:
+        - newexpr
+        # Keep the Go 1.27 upgrade separate from repository-wide literal rewrites.
+        - embedlit
+    revive:
+      rules:
+        - name: dot-imports
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Allow hardcoded credentials in test fixtures (HTTP basic-auth URLs etc.)
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G101"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

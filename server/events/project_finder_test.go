@@ -1,0 +1,746 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+
+package events_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/runatlantis/atlantis/server/core/config/raw"
+	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/events"
+	"github.com/runatlantis/atlantis/server/logging"
+	. "github.com/runatlantis/atlantis/testing"
+)
+
+// warnRecorder wraps a logger and records Warn messages for assertions.
+type warnRecorder struct {
+	logging.SimpleLogging
+	warnings []string
+}
+
+func newWarnRecorder(t *testing.T) *warnRecorder {
+	return &warnRecorder{SimpleLogging: logging.NewNoopLogger(t)}
+}
+
+func (w *warnRecorder) Warn(format string, a ...any) {
+	w.warnings = append(w.warnings, fmt.Sprintf(format, a...))
+	w.SimpleLogging.Warn(format, a...)
+}
+
+func (w *warnRecorder) hasWarnContaining(substr string) bool {
+	for _, msg := range w.warnings {
+		if strings.Contains(msg, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+var modifiedRepo = "owner/repo"
+var m = events.DefaultProjectFinder{}
+var nestedModules1 string
+var nestedModules2 string
+var topLevelModules string
+var envDir string
+
+func setupTmpRepos(t *testing.T) {
+	// Create different repo structures for testing.
+
+	// 1. Nested modules directory inside a project
+	// non-tf
+	// terraform.tfstate
+	// terraform.tfstate.backup
+	// project1/
+	//   main.tf
+	//   terraform.tfstate
+	//   terraform.tfstate.backup
+	//   modules/
+	//     main.tf
+	nestedModules1 = t.TempDir()
+	err := os.MkdirAll(filepath.Join(nestedModules1, "project1/modules"), 0700)
+	Ok(t, err)
+	files := []string{
+		"non-tf",
+		".tflint.hcl",
+		"terraform.tfstate.backup",
+		"project1/main.tf",
+		"project1/terraform.tfstate",
+		"project1/terraform.tfstate.backup",
+		"project1/modules/main.tf",
+	}
+	for _, f := range files {
+		_, err = os.Create(filepath.Join(nestedModules1, f))
+		Ok(t, err)
+	}
+
+	// 2. Nested modules dir inside top-level project
+	// main.tf
+	//  modules/
+	//    main.tf
+	// We can just re-use part of the previous dir structure.
+	nestedModules2 = filepath.Join(nestedModules1, "project1")
+
+	// 3. Top-level modules
+	//  modules/
+	//    main.tf
+	//  project1/
+	//    main.tf
+	//  project2/
+	//    main.tf
+	topLevelModules = t.TempDir()
+	for _, path := range []string{"modules", "project1", "project2"} {
+		err = os.MkdirAll(filepath.Join(topLevelModules, path), 0700)
+		Ok(t, err)
+		_, err = os.Create(filepath.Join(topLevelModules, path, "main.tf"))
+		Ok(t, err)
+	}
+
+	// 4. Env/ dir
+	// main.tf
+	// env/
+	//   staging.tfvars
+	//   production.tfvars
+	//   global-env-config.auto.tfvars.json
+	envDir = t.TempDir()
+	err = os.MkdirAll(filepath.Join(envDir, "env"), 0700)
+	Ok(t, err)
+	_, err = os.Create(filepath.Join(envDir, "env/staging.tfvars"))
+	Ok(t, err)
+	_, err = os.Create(filepath.Join(envDir, "env/production.tfvars"))
+	Ok(t, err)
+}
+
+func TestDetermineWorkspaceFromHCL(t *testing.T) {
+	noopLogger := logging.NewNoopLogger(t)
+	cases := []struct {
+		description       string
+		repoDir           string
+		distribution      string
+		expectedWorkspace string
+	}{
+		{
+			"Should use configured Terraform Cloud workspace from .tf",
+			"workspace-configured",
+			"",
+			"test-workspace",
+		},
+		{
+			"If no 'cloud' block was configured, it should use 'default' workspace",
+			"no-cloud-block",
+			"",
+			"default",
+		},
+		{
+			"If 'cloud' was specify but without `name` attribute, it should use 'default' workspace",
+			"cloud-block-without-workspace-name",
+			"",
+			"default",
+		},
+		{
+			"OpenTofu: detect workspace from .tofu file",
+			"workspace-tofu-only",
+			"opentofu",
+			"tofu-workspace",
+		},
+		{
+			"OpenTofu: detect workspace from .tofu.json file",
+			"workspace-tofu-json-only",
+			"opentofu",
+			"tofu-json-workspace",
+		},
+		{
+			"OpenTofu: .tofu workspace overrides same-basename .tf",
+			"workspace-tofu-overrides-tf",
+			"opentofu",
+			"tofu-workspace",
+		},
+		{
+			"Terraform: ignores .tofu file, returns default",
+			"workspace-tofu-only",
+			"",
+			"default",
+		},
+		{
+			"Terraform: ignores .tofu.json file, returns default",
+			"workspace-tofu-json-only",
+			"",
+			"default",
+		},
+		{
+			"Terraform: with same-basename .tf and .tofu, reads .tf",
+			"workspace-tofu-overrides-tf",
+			"",
+			"tf-workspace",
+		},
+		{
+			"Terraform: .tf.json happy path",
+			"workspace-tf-json-only",
+			"",
+			"tf-json-workspace",
+		},
+		{
+			"OpenTofu: .tf.json happy path (compatibility)",
+			"workspace-tf-json-only",
+			"opentofu",
+			"tf-json-workspace",
+		},
+		{
+			"OpenTofu: reads .tf without .tofu present",
+			"workspace-configured",
+			"opentofu",
+			"test-workspace",
+		},
+		{
+			"OpenTofu: .tofu.json overrides same-basename .tf.json",
+			"workspace-json-precedence",
+			"opentofu",
+			"tofu-json-workspace",
+		},
+		{
+			"Terraform: .tf.json wins over .tofu.json",
+			"workspace-json-precedence",
+			"",
+			"tf-json-workspace",
+		},
+		{
+			"Terraform: ignores malformed .tofu, returns default",
+			"workspace-malformed-tofu",
+			"",
+			"default",
+		},
+		{
+			"OpenTofu: malformed .tofu returns default",
+			"workspace-malformed-tofu",
+			"opentofu",
+			"default",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.description, func(t *testing.T) {
+			fullPath := filepath.Join("testdata/test-repos", c.repoDir)
+			got, err := m.DetermineWorkspaceFromHCL(noopLogger, fullPath, c.distribution)
+			if err != nil {
+				t.Fatal("got error:", err)
+			}
+			if got != c.expectedWorkspace {
+				t.Fatalf("Expected %q but got %q", c.expectedWorkspace, got)
+			}
+		})
+	}
+}
+
+func TestDetermineWorkspaceFromHCL_MalformedFiles(t *testing.T) {
+	cases := []struct {
+		description       string
+		repoDir           string
+		distribution      string
+		expectedWorkspace string
+		expectWarn        string // substring expected in warnings; "" means no warning expected
+	}{
+		{
+			"Terraform: valid .tf sibling + malformed .tofu → reads .tf, no .tofu warning",
+			"workspace-tf-plus-malformed-tofu",
+			"",
+			"tf-workspace",
+			"",
+		},
+		{
+			"OpenTofu: valid .tf sibling + malformed .tofu → precedence suppresses .tf, default workspace",
+			"workspace-tf-plus-malformed-tofu",
+			"opentofu",
+			"default",
+			"",
+		},
+		{
+			"Terraform: malformed .tf.json → parse fails silently, returns default",
+			"workspace-malformed-tf-json",
+			"",
+			"default",
+			"",
+		},
+		{
+			"OpenTofu: malformed .tf.json → parse fails silently, returns default",
+			"workspace-malformed-tf-json",
+			"opentofu",
+			"default",
+			"",
+		},
+		{
+			"Terraform: malformed .tofu.json only → ignored, no warning",
+			"workspace-malformed-tofu-json",
+			"",
+			"default",
+			"",
+		},
+		{
+			"OpenTofu: malformed .tofu.json → parse fails silently, returns default",
+			"workspace-malformed-tofu-json",
+			"opentofu",
+			"default",
+			"",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.description, func(t *testing.T) {
+			recorder := newWarnRecorder(t)
+			fullPath := filepath.Join("testdata/test-repos", c.repoDir)
+			got, err := m.DetermineWorkspaceFromHCL(recorder, fullPath, c.distribution)
+			if err != nil {
+				t.Fatal("got error:", err)
+			}
+			if got != c.expectedWorkspace {
+				t.Fatalf("Expected workspace %q but got %q", c.expectedWorkspace, got)
+			}
+			if c.expectWarn != "" && !recorder.hasWarnContaining(c.expectWarn) {
+				t.Fatalf("Expected warning containing %q, got: %v", c.expectWarn, recorder.warnings)
+			}
+			if c.expectWarn == "" && len(recorder.warnings) > 0 {
+				t.Fatalf("Expected no warnings, got: %v", recorder.warnings)
+			}
+		})
+	}
+}
+
+func TestDetermineProjects(t *testing.T) {
+	noopLogger := logging.NewNoopLogger(t)
+	setupTmpRepos(t)
+
+	defaultAutoplanFileList := "**/*.tf,**/*.tfvars,**/*.tfvars.json,**/terragrunt.hcl,**/.terraform.lock.hcl"
+
+	cases := []struct {
+		description      string
+		files            []string
+		expProjectPaths  []string
+		repoDir          string
+		autoplanFileList string
+	}{
+		{
+			"If no files were modified then should return an empty list",
+			nil,
+			nil,
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should ignore non .tf files and return an empty list",
+			[]string{"non-tf", "non.tf.suffix"},
+			nil,
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should ignore .tflint.hcl files and return an empty list",
+			[]string{".tflint.hcl", "project1/.tflint.hcl"},
+			nil,
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should plan in the parent directory from modules if that dir has a main.tf",
+			[]string{"project1/modules/main.tf"},
+			[]string{"project1"},
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should plan in the parent directory from modules if that dir has a main.tf",
+			[]string{"modules/main.tf"},
+			[]string{"."},
+			nestedModules2,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should plan in the parent directory from modules when module is in a subdir if that dir has a main.tf",
+			[]string{"modules/subdir/main.tf"},
+			[]string{"."},
+			nestedModules2,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should not plan in the parent directory from modules if that dir does not have a main.tf",
+			[]string{"modules/main.tf"},
+			[]string{},
+			topLevelModules,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should not plan in the parent directory from modules if that dir does not have a main.tf",
+			[]string{"modules/main.tf", "project1/main.tf"},
+			[]string{"project1"},
+			topLevelModules,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should ignore tfstate files and return an empty list",
+			[]string{"terraform.tfstate", "terraform.tfstate.backup", "parent/terraform.tfstate", "parent/terraform.tfstate.backup"},
+			nil,
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should return '.' when changed file is at root",
+			[]string{"a.tf"},
+			[]string{"."},
+			nestedModules2,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should return directory when changed file is in a dir",
+			[]string{"project1/a.tf"},
+			[]string{"project1"},
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should return parent dir when changed file is in an env/ dir",
+			[]string{"env/staging.tfvars"},
+			[]string{"."},
+			envDir,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should de-duplicate when multiple files changed in the same dir",
+			[]string{"env/staging.tfvars", "main.tf", "other.tf"},
+			[]string{"."},
+			"",
+			defaultAutoplanFileList,
+		},
+		{
+			"Should ignore changes in a dir that was deleted",
+			[]string{"wasdeleted/main.tf"},
+			[]string{},
+			"",
+			defaultAutoplanFileList,
+		},
+		{
+			"Should not ignore terragrunt.hcl files",
+			[]string{"terragrunt.hcl"},
+			[]string{"."},
+			nestedModules2,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should find terragrunt.hcl file inside a nested directory",
+			[]string{"project1/terragrunt.hcl"},
+			[]string{"project1"},
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+		{
+			"Should find packer files and ignore default tf files",
+			[]string{"project1/image.pkr.hcl", "project2/main.tf"},
+			[]string{"project1"},
+			topLevelModules,
+			"**/*.pkr.hcl",
+		},
+		{
+			"Should find yaml files in addition to defaults",
+			[]string{"project1/ansible.yml", "project2/main.tf"},
+			[]string{"project1", "project2"},
+			topLevelModules,
+			"**/*.tf,**/*.yml",
+		},
+		{
+			"Should find yaml files unless excluded",
+			[]string{"project1/ansible.yml", "project2/config.yml"},
+			[]string{"project1"},
+			topLevelModules,
+			"**/*.yml,!project2/*.yml",
+		},
+		{
+			"Should not ignore .terraform.lock.hcl files",
+			[]string{"project1/.terraform.lock.hcl"},
+			[]string{"project1"},
+			nestedModules1,
+			defaultAutoplanFileList,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.description, func(t *testing.T) {
+			projects := m.DetermineProjects(noopLogger, c.files, modifiedRepo, c.repoDir, c.autoplanFileList, nil)
+
+			// Extract the paths from the projects. We use a slice here instead of a
+			// map so we can test whether there are duplicates returned.
+			var paths []string
+			for _, project := range projects {
+				paths = append(paths, project.Path)
+				// Check that the project object has the repo set properly.
+				Equals(t, modifiedRepo, project.RepoFullName)
+			}
+			Assert(t, len(c.expProjectPaths) == len(paths),
+				"exp %q but found %q", c.expProjectPaths, paths)
+
+			for _, expPath := range c.expProjectPaths {
+				if !slices.Contains(paths, expPath) {
+					t.Fatalf("exp %q but was not in paths %v", expPath, paths)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultProjectFinder_DetermineProjectsViaConfig(t *testing.T) {
+	// Create dir structure:
+	// main.tf
+	// project1/
+	//   main.tf
+	//   terraform.tfvars.json
+	// project2/
+	//   main.tf
+	//   terraform.tfvars
+	// modules/
+	//   module/
+	//	  main.tf
+	tmpDir := DirStructure(t, map[string]any{
+		"main.tf": nil,
+		"project1": map[string]any{
+			"main.tf":               nil,
+			"terraform.tfvars.json": nil,
+		},
+		"project2": map[string]any{
+			"main.tf":          nil,
+			"terraform.tfvars": nil,
+		},
+		"modules": map[string]any{
+			"module": map[string]any{
+				"main.tf": nil,
+			},
+		},
+	})
+
+	cases := []struct {
+		description  string
+		config       valid.RepoCfg
+		modified     []string
+		expProjPaths []string
+	}{
+		{
+			// When autoplan is disabled, we still return the modified project.
+			// If our caller is interested in autoplan enabled projects, they'll
+			// need to filter the results.
+			description: "autoplan disabled",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: ".",
+						Autoplan: valid.Autoplan{
+							Enabled:      false,
+							WhenModified: []string{"**/*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"main.tf"},
+			expProjPaths: []string{"."},
+		},
+		{
+			description: "autoplan default",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: ".",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"**/*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"main.tf"},
+			expProjPaths: []string{"."},
+		},
+		{
+			description: "parent dir modified",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"**/*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"main.tf"},
+			expProjPaths: nil,
+		},
+		{
+			description: "parent dir modified matches",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project1",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"../**/*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"main.tf"},
+			expProjPaths: []string{"project1"},
+		},
+		{
+			description: "dir deleted",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project3",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"project3/main.tf"},
+			expProjPaths: nil,
+		},
+		{
+			description: "multiple projects",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: ".",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"*.tf"},
+						},
+					},
+					{
+						Dir: "project1",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"../modules/module/*.tf", "**/*.tf"},
+						},
+					},
+					{
+						Dir: "project2",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"**/*.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"main.tf", "modules/module/another.tf", "project2/nontf.txt"},
+			expProjPaths: []string{".", "project1"},
+		},
+		{
+			description: ".tfvars file modified",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project2",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"*.tf*"},
+						},
+					},
+				},
+			},
+			modified:     []string{"project2/terraform.tfvars"},
+			expProjPaths: []string{"project2"},
+		},
+		{
+			description: ".terraform.lock.hcl file modified",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project2",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: raw.DefaultAutoPlanWhenModified(),
+						},
+					},
+				},
+			},
+			modified:     []string{"project2/.terraform.lock.hcl"},
+			expProjPaths: []string{"project2"},
+		},
+		{
+			description: "file excluded",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project1",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"*.tf", "!exclude-me.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"project1/exclude-me.tf"},
+			expProjPaths: nil,
+		},
+		{
+			description: "some files excluded and others included",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project1",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"*.tf", "!exclude-me.tf"},
+						},
+					},
+				},
+			},
+			modified:     []string{"project1/exclude-me.tf", "project1/include-me.tf"},
+			expProjPaths: []string{"project1"},
+		},
+		{
+			description: "multiple dirs excluded",
+			config: valid.RepoCfg{
+				Projects: []valid.Project{
+					{
+						Dir: "project1",
+						Autoplan: valid.Autoplan{
+							Enabled:      true,
+							WhenModified: []string{"**/*.tf", "!subdir1/*", "!subdir2/*"},
+						},
+					},
+				},
+			},
+			modified:     []string{"project1/subdir1/main.tf", "project1/subdir2/main.tf"},
+			expProjPaths: nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.description, func(t *testing.T) {
+			pf := events.DefaultProjectFinder{}
+			projects, err := pf.DetermineProjectsViaConfig(logging.NewNoopLogger(t), c.modified, c.config, tmpDir, nil)
+			Ok(t, err)
+			Equals(t, len(c.expProjPaths), len(projects))
+			for i, proj := range projects {
+				Equals(t, c.expProjPaths[i], proj.Dir)
+			}
+		})
+	}
+}
+
+func TestDetermineWorkspaceFromHCL_RejectsUnsafeName(t *testing.T) {
+	// A Terraform Cloud workspace name is read straight out of pull-request
+	// controlled HCL, and Atlantis uses it to build paths, so it has to satisfy
+	// the same rules as a workspace named in atlantis.yaml or in a comment.
+	noopLogger := logging.NewNoopLogger(t)
+	m := events.DefaultProjectFinder{}
+	fullPath := filepath.Join("testdata/test-repos", "workspace-unsafe-name")
+
+	got, err := m.DetermineWorkspaceFromHCL(noopLogger, fullPath, "")
+
+	ErrContains(t, "cannot contain '/'", err)
+	Equals(t, "", got)
+}

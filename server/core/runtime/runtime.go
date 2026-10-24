@@ -1,0 +1,166 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package runtime holds code for actually running commands vs. preparing
+// and constructing.
+package runtime
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	version "github.com/hashicorp/go-version"
+	"github.com/runatlantis/atlantis/server/core/planstore"
+	runtimemodels "github.com/runatlantis/atlantis/server/core/runtime/models"
+	"github.com/runatlantis/atlantis/server/core/terraform"
+	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
+	"github.com/runatlantis/atlantis/server/utils"
+)
+
+const (
+	// lineBeforeRunURL is the line output during a remote operation right before
+	// a link to the run url will be output.
+	lineBeforeRunURL     = "To view this run in a browser, visit:"
+	planfileSlashReplace = "::"
+	planStoreReposDir    = planstore.ReposDir
+)
+
+// TerraformExec brings the interface from TerraformClient into this package
+// without causing circular imports.
+type TerraformExec interface {
+	RunCommandWithVersion(ctx command.ProjectContext, path string, args []string, envs map[string]string, d terraform.Distribution, v *version.Version, workspace string) (string, error)
+	EnsureVersion(log logging.SimpleLogging, d terraform.Distribution, v *version.Version) error
+}
+
+// AsyncTFExec brings the interface from TerraformClient into this package
+// without causing circular imports.
+// It's split from TerraformExec because due to a bug in pegomock with channels,
+// we can't generate a mock for it so we hand-write it for this specific method.
+//
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_async_tfexec.go AsyncTFExec
+type AsyncTFExec interface {
+	// RunCommandAsync runs terraform with args. It immediately returns an
+	// input and output channel. Callers can use the output channel to
+	// get the realtime output from the command.
+	// Callers can use the input channel to pass stdin input to the command.
+	// If any error is passed on the out channel, there will be no
+	// further output (so callers are free to exit).
+	RunCommandAsync(ctx command.ProjectContext, path string, args []string, envs map[string]string, d terraform.Distribution, v *version.Version, workspace string) (chan<- string, <-chan runtimemodels.Line)
+}
+
+// StatusUpdater brings the interface from CommitStatusUpdater into this package
+// without causing circular imports.
+//
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_status_updater.go StatusUpdater
+type StatusUpdater interface {
+	UpdateProject(ctx command.ProjectContext, cmdName command.Name, status models.CommitStatus, url string, res *command.ProjectCommandOutput) error
+}
+
+// Runner mirrors events.StepRunner as a way to bring it into this package
+//
+//go:generate go tool pegomock generate --package mocks -o mocks/mock_runner.go Runner
+type Runner interface {
+	Run(ctx command.ProjectContext, extraArgs []string, path string, envs map[string]string) (string, error)
+}
+
+// NullRunner is a runner that isn't configured for a given plan type but outputs nothing
+type NullRunner struct{}
+
+func (p NullRunner) Run(ctx command.ProjectContext, _ []string, _ string, _ map[string]string) (string, error) {
+	ctx.Log.Debug("runner not configured for plan type")
+	return "", nil
+}
+
+// RemoteBackendUnsupportedRunner is a runner that is responsible for outputting that the remote backend is unsupported
+type RemoteBackendUnsupportedRunner struct{}
+
+func (p RemoteBackendUnsupportedRunner) Run(ctx command.ProjectContext, _ []string, _ string, _ map[string]string) (string, error) {
+	ctx.Log.Debug("runner not configured for remote backend")
+	return "Remote backend is unsupported for this step.", nil
+}
+
+// MustConstraint returns a constraint. It panics on error.
+func MustConstraint(constraint string) version.Constraints {
+	c, err := version.NewConstraint(constraint)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// GetPlanFilename returns the filename (not the path) of the generated tf plan
+// given a workspace and project name.
+func GetPlanFilename(workspace string, projName string) string {
+	if projName == "" {
+		return fmt.Sprintf("%s.tfplan", workspace)
+	}
+	projName = strings.ReplaceAll(projName, "/", planfileSlashReplace)
+	return fmt.Sprintf("%s-%s.tfplan", projName, workspace)
+}
+
+// GetPlanFileDir returns the directory where Atlantis stores the plan file for ctx.
+// When LocalSharePlanDir is set to data-dir, this must mirror FileWorkspace.cloneDir
+// plus ctx.RepoRelDir so default installs keep the legacy on-disk layout.
+func GetPlanFileDir(ctx command.ProjectContext, projectPath string) string {
+	if ctx.LocalSharePlanDir == "" {
+		return projectPath
+	}
+	return filepath.Join(ctx.LocalSharePlanDir, planStoreReposDir, ctx.BaseRepo.FullName, strconv.Itoa(ctx.Pull.Num), ctx.Workspace, ctx.RepoRelDir)
+}
+
+// EnsurePlanFileDir creates the directory for ctx's generated Terraform plan file.
+func EnsurePlanFileDir(ctx command.ProjectContext, projectPath string) error {
+	if ctx.LocalSharePlanDir == "" {
+		return nil
+	}
+	planFileDir := GetPlanFileDir(ctx, projectPath)
+	if err := utils.EnsureSubPath(filepath.Join(ctx.LocalSharePlanDir, planStoreReposDir), planFileDir); err != nil {
+		return fmt.Errorf("plan file path traversal detected: %w", err)
+	}
+	if err := os.MkdirAll(planFileDir, 0700); err != nil {
+		return fmt.Errorf("creating plan file directory: %w", err)
+	}
+	return nil
+}
+
+// GetPlanFilePath returns the full path to the generated Terraform plan file.
+func GetPlanFilePath(ctx command.ProjectContext, projectPath string) string {
+	return filepath.Join(GetPlanFileDir(ctx, projectPath), GetPlanFilename(ctx.Workspace, ctx.ProjectName))
+}
+
+// GetPlanPullDir returns the root directory for all plan files for a pull request.
+func GetPlanPullDir(localSharePlanDir string, r models.Repo, p models.PullRequest) string {
+	return planstore.PullDir(localSharePlanDir, r.FullName, p.Num)
+}
+
+// isRemotePlan returns true if planContents are from a plan that was generated
+// using TFE remote operations.
+func IsRemotePlan(planContents []byte) bool {
+	// We add a header to plans generated by the remote backend so we can
+	// detect that they're remote in the apply phase.
+	remoteOpsHeaderBytes := []byte(remoteOpsHeader)
+	return bytes.HasPrefix(planContents, remoteOpsHeaderBytes)
+}
+
+// ProjectNameFromPlanfile returns the project name that a planfile with name
+// filename is for. If filename is for a project without a name then it will
+// return an empty string. workspace is the workspace this project is in.
+func ProjectNameFromPlanfile(workspace string, filename string) (string, error) {
+	r, err := regexp.Compile(fmt.Sprintf(`(.*?)-%s\.tfplan`, workspace))
+	if err != nil {
+		return "", fmt.Errorf("compiling project name regex, this is a bug: %w", err)
+	}
+	projMatch := r.FindAllStringSubmatch(filename, 1)
+	if projMatch == nil {
+		return "", nil
+	}
+	rawProjName := projMatch[0][1]
+	return strings.ReplaceAll(rawProjName, planfileSlashReplace, "/"), nil
+}
